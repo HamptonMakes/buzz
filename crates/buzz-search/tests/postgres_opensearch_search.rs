@@ -61,8 +61,17 @@ fn opensearch_url() -> String {
 /// A database layer with the search outbox on, as the relay runs it when
 /// OpenSearch is configured.
 async fn sync_db() -> Db {
+    let db = unsynced_db().await;
+    search_outbox::enable(db.pool())
+        .await
+        .expect("enable outbox");
+    db
+}
+
+/// A database layer as a relay without OpenSearch runs it: admission queues
+/// nothing.
+async fn unsynced_db() -> Db {
     let (pool, _) = search_suite::setup().await;
-    search_outbox::enable(&pool).await.expect("enable outbox");
     pool.close().await;
     Db::new(&DbConfig {
         database_url: std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -84,6 +93,16 @@ async fn sync_index() -> (SearchIndex, String) {
     .expect("OpenSearch client");
     index.ensure().await.expect("create index");
     (index, prefix)
+}
+
+/// A message signed `offset` seconds from now.
+fn message_at(keys: &Keys, content: &str, offset: i64) -> Event {
+    EventBuilder::new(Kind::Custom(9), content)
+        .custom_created_at(Timestamp::from(
+            (Timestamp::now().as_secs() as i64 + offset) as u64,
+        ))
+        .sign_with_keys(keys)
+        .expect("sign")
 }
 
 fn message(keys: &Keys, content: &str) -> Event {
@@ -593,6 +612,194 @@ async fn scrubbed_and_erased_messages_no_longer_match() {
         vec![*reply.id.as_bytes()]
     );
 
+    indexer.abort();
+    index.delete().await.expect("delete index");
+}
+
+/// Keys queued in the outbox, newest event first.
+async fn queued_events(db: &Db) -> Vec<[u8; 32]> {
+    sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT event_id FROM search_outbox ORDER BY event_created_at DESC, event_id DESC",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("queued rows")
+    .into_iter()
+    .map(|id| id.try_into().expect("32-byte id"))
+    .collect()
+}
+
+/// Index what is queued and make it visible to search.
+async fn drain(indexer: &Indexer, index: &SearchIndex) {
+    indexer.drain().await.expect("drain");
+    index.refresh().await.expect("refresh");
+}
+
+/// Messages stored before OpenSearch was configured are backfilled newest
+/// first, one bounded batch at a time. A restart resumes below the last
+/// batch instead of starting over, live messages are indexed while the
+/// backfill runs, and backfilling again creates no duplicate documents.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn stored_messages_are_backfilled_newest_first_and_resume() {
+    let db = unsynced_db().await;
+    let (index, prefix) = sync_index().await;
+    let community = search_suite::mk_community(db.pool(), "backfill.example").await;
+    // Another community, with nothing to backfill, takes its turns too.
+    search_suite::mk_community(db.pool(), "bystander.example").await;
+    let keys = Keys::generate();
+    // Oldest first: stored[4] is the newest.
+    let stored: Vec<Event> = (0..5)
+        .map(|n| message_at(&keys, &format!("oldword {n}"), n - 10))
+        .collect();
+    for event in &stored {
+        db.insert_event(community, event, None)
+            .await
+            .expect("insert");
+    }
+    let id = |event: &Event| *event.id.as_bytes();
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+
+    search_outbox::enable(db.pool())
+        .await
+        .expect("enable outbox");
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    // Two keys per batch, and no more queued than one batch at a time.
+    let indexer = || {
+        Indexer::new(db.clone(), index.clone())
+            .with_batch_size(2)
+            .with_backfill_bound(2)
+    };
+
+    // The first batch is the two newest messages.
+    let first = indexer();
+    assert_eq!(first.backfill().await.expect("backfill"), 2);
+    assert_eq!(
+        queued_events(&db).await,
+        vec![id(&stored[4]), id(&stored[3])]
+    );
+    assert_eq!(
+        first.backfill().await.expect("backfill"),
+        0,
+        "nothing more is queued while the outbox is at its bound"
+    );
+    drain(&first, &index).await;
+    assert_eq!(
+        find(&service, community, "oldword").await,
+        vec![id(&stored[4]), id(&stored[3])]
+    );
+
+    // Stop here. A new indexer, as after a restart, continues below the
+    // first batch.
+    drop(first);
+    let restarted = indexer();
+    assert_eq!(restarted.backfill().await.expect("backfill"), 2);
+    assert_eq!(
+        queued_events(&db).await,
+        vec![id(&stored[2]), id(&stored[1])]
+    );
+
+    // A live message admitted mid-backfill is indexed by the next drain.
+    let live = message(&keys, "oldword live");
+    db.insert_event(community, &live, None)
+        .await
+        .expect("insert live");
+    drain(&restarted, &index).await;
+    let completed: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT completed_at FROM search_backfill WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .fetch_one(db.pool())
+            .await
+            .expect("marker");
+    assert!(completed.is_none(), "the backfill is still running");
+    assert_eq!(
+        find(&service, community, "oldword").await,
+        vec![
+            id(&live),
+            id(&stored[4]),
+            id(&stored[3]),
+            id(&stored[2]),
+            id(&stored[1])
+        ]
+    );
+
+    // The last batch is short, which completes the community.
+    assert_eq!(restarted.backfill().await.expect("backfill"), 1);
+    drain(&restarted, &index).await;
+    assert_eq!(restarted.backfill().await.expect("backfill"), 0);
+    let everything = vec![
+        id(&live),
+        id(&stored[4]),
+        id(&stored[3]),
+        id(&stored[2]),
+        id(&stored[1]),
+        id(&stored[0]),
+    ];
+    assert_eq!(find(&service, community, "oldword").await, everything);
+
+    // Backfill everything again: the documents are rewritten, not doubled.
+    sqlx::query("DELETE FROM search_backfill")
+        .execute(db.pool())
+        .await
+        .expect("restart backfill");
+    while restarted.backfill().await.expect("backfill") > 0 {
+        drain(&restarted, &index).await;
+    }
+    drain(&restarted, &index).await;
+    assert_eq!(find(&service, community, "oldword").await, everything);
+    let count: serde_json::Value = raw_client()
+        .count(opensearch::CountParts::Index(&[&format!(
+            "{prefix}messages"
+        )]))
+        .send()
+        .await
+        .expect("count")
+        .json()
+        .await
+        .expect("count body");
+    assert_eq!(count["count"], 6, "{count}");
+    index.delete().await.expect("delete index");
+}
+
+/// The lease holder starts backfilling on its own once OpenSearch is
+/// configured.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn the_indexer_backfills_on_its_own() {
+    let db = unsynced_db().await;
+    let (index, _) = sync_index().await;
+    let community = search_suite::mk_community(db.pool(), "auto.example").await;
+    let keys = Keys::generate();
+    for n in 0..5 {
+        db.insert_event(
+            community,
+            &message_at(&keys, &format!("autoword {n}"), -n),
+            None,
+        )
+        .await
+        .expect("insert");
+    }
+    search_outbox::enable(db.pool())
+        .await
+        .expect("enable outbox");
+    let indexer = tokio::spawn(
+        Indexer::new(db.clone(), index.clone())
+            .with_batch_size(2)
+            .with_backfill_bound(2)
+            .run(),
+    );
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            index.refresh().await.expect("refresh");
+            if find(&service, community, "autoword").await.len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("every stored message becomes searchable");
     indexer.abort();
     index.delete().await.expect("delete index");
 }

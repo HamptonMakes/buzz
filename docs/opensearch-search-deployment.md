@@ -20,13 +20,25 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   seconds. A batch the cluster rejects outright (HTTP 400
   or 413) skips its community for that pass, so other communities keep
   indexing.
+- The lease holder also backfills messages stored before the outbox was on.
+  For each community it queues the keys of searchable messages in batches
+  of 500, newest first, and records how far it got in `search_backfill`
+  in the same transaction, so a restart resumes below the last batch.
+  Communities take turns one batch each. It queues only while the outbox
+  holds fewer than 2,000 rows, so live messages wait behind at most that
+  many backfill rows. Backfill goes through the same outbox and indexer as
+  live writes, and queuing an indexed message again only rewrites its
+  document. A community's backfill is complete when a batch comes back
+  short; new communities backfill once, cheaply. To backfill a community
+  again, delete its `search_backfill` row (or all rows for every
+  community); the leader starts over from the newest message.
 - The index (`buzz-messages`) is created by the leader on its first attempt,
   so an unreachable cluster never delays startup. Writes go through the alias
   and never create an index, so a deleted index is recreated with its mapping
   on the next attempt. Documents hold the message
   text in an indexed field only; `_source` does not store it.
-- Community deletion fences and purges `search_outbox` with the community's
-  other rows. It does not yet remove the community's documents from the
+- Community deletion fences and purges `search_outbox` and `search_backfill`
+  with the community's other rows. It does not yet remove the community's documents from the
   index. Every search filters on the community, and a deleted community's id
   is never reused, so those documents never match a search, but their words
   stay in the index.
@@ -40,20 +52,38 @@ run on Postgres full-text search; the index is built ahead of switching reads.
 
 ## Rollout order
 
-1. Deploy a release that knows the `search_outbox` table as a pending
-   deletion-scoped table, before the release with migration `0106`. That
-   keeps community deletion working in a mixed fleet and after a rollback.
-2. Deploy the release with the migration. Without `BUZZ_OPENSEARCH_URL`
+1. Deploy a release that knows the `search_outbox` and `search_backfill`
+   tables as pending deletion-scoped tables, before the release with
+   migrations `0106` and `0107`. That keeps community deletion working in a
+   mixed fleet and after a rollback.
+2. Deploy the release with the migrations. Without `BUZZ_OPENSEARCH_URL`
    nothing is queued and nothing changes.
 3. Set `BUZZ_OPENSEARCH_URL` on every relay instance. Each instance queues
    only the messages it admits itself, so an instance without the setting
-   leaves gaps. Startup fails if migration `0106` has not run. Only messages
-   admitted after the whole fleet has the setting are covered; older ones need
-   a backfill, which is not part of this release.
+   leaves gaps. Startup fails if migration `0106` has not run. The backfill
+   starts as soon as the first instance holds the lease and covers every
+   message stored before that. If instances without the setting admitted
+   messages after it started, run `DELETE FROM search_backfill` once the
+   whole fleet has the setting to backfill again.
 
 If you stream Postgres changes through logical replication, keep
-`search_outbox` out of the publication: its rows are short-lived queue
-entries, not data.
+`search_outbox` and `search_backfill` out of the publication: their rows are
+short-lived queue entries and progress markers, not data.
+
+## Metrics and throughput
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `buzz_search_backfill_queued_total` | `community` | Message keys backfill queued. |
+| `buzz_search_backfill_cursor_timestamp_seconds` | `community` | Creation time of the oldest message queued so far; everything newer is queued. |
+| `buzz_search_backfill_complete` | `community` | 1 once the community's backfill is complete. |
+| `buzz_search_indexed_documents_total` | `community`, `op` (`write`, `remove`) | Documents the indexer wrote or removed. Its rate is the indexing rate. |
+
+Each drain pass that indexed anything ends with an info log,
+`search indexer drained the outbox`, with `batches`, `written`, `removed`,
+`elapsed_ms` and `documents_per_second`. To measure throughput locally, store
+messages with `BUZZ_OPENSEARCH_URL` unset, then start the relay with it set:
+the backfill passes log their rates as they catch up.
 
 ## Local run
 
@@ -64,4 +94,5 @@ curl -s 'localhost:9200/buzz-messages/_search?pretty'
 ```
 
 Watch the queue drain with
-`psql -c 'SELECT count(*) FROM search_outbox'`.
+`psql -c 'SELECT count(*) FROM search_outbox'` and the backfill progress with
+`psql -c 'SELECT * FROM search_backfill'`.
