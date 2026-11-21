@@ -299,3 +299,94 @@ async fn claim_passes_over_skipped_and_held_communities() {
         .expect("claim")
         .is_none());
 }
+
+/// Two workers can claim one community at once, but never rows of the same
+/// event. A message changed or deleted while a batch holds its earlier row
+/// gets a new row that no concurrent batch can claim; it is claimed, with the
+/// newer state, only once the holding batch completes. So a stale state
+/// never overwrites a newer one, and a delete is never followed by a stale
+/// write.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn concurrent_claims_of_one_community_never_share_an_event() {
+    let db = connect().await;
+    let pool = db.pool();
+    search_outbox::enable(pool).await.expect("enable outbox");
+    let community = create_community(pool).await;
+    let keys = Keys::generate();
+    for n in 0..200 {
+        db.insert_event(
+            community,
+            &signed(&keys, 9, &format!("message {n}"), vec![]),
+            None,
+        )
+        .await
+        .expect("insert");
+    }
+
+    let first = search_outbox::claim_batch_share(pool, 1000, &[], 2)
+        .await
+        .expect("claim")
+        .expect("a batch");
+    let changed = first.documents[0].event_id;
+    let deleted = first.documents[1].event_id;
+    // What an edit and a deletion queue while the first batch is in flight.
+    for event in [changed, deleted] {
+        sqlx::query(
+            "INSERT INTO search_outbox (community_id, event_id, event_created_at) \
+             SELECT community_id, id, created_at FROM events \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(event.as_slice())
+        .execute(pool)
+        .await
+        .expect("queue a change");
+    }
+    sqlx::query("UPDATE events SET deleted_at = now() WHERE community_id = $1 AND id = $2")
+        .bind(community.as_uuid())
+        .bind(deleted.as_slice())
+        .execute(pool)
+        .await
+        .expect("delete");
+
+    let second = search_outbox::claim_batch_share(pool, 1000, &[], 2)
+        .await
+        .expect("claim")
+        .expect("a concurrent batch of the same community");
+    assert_eq!(second.community(), community);
+    let events =
+        |batch: &search_outbox::SearchOutboxBatch| -> std::collections::BTreeSet<[u8; 32]> {
+            batch
+                .documents
+                .iter()
+                .map(|document| document.event_id)
+                .chain(batch.removed.iter().copied())
+                .collect()
+        };
+    let (held, concurrent) = (events(&first), events(&second));
+    assert!(!concurrent.is_empty());
+    assert!(
+        held.is_disjoint(&concurrent),
+        "two batches in flight hold the same event"
+    );
+    drop(second);
+    first.complete().await.expect("complete");
+
+    // Only now are the changes claimed, with their current state.
+    let after = search_outbox::claim_batch(pool, 1000, &[])
+        .await
+        .expect("claim")
+        .expect("a batch");
+    assert!(after
+        .documents
+        .iter()
+        .any(|document| document.event_id == changed));
+    assert!(after.removed.contains(&deleted));
+    assert!(after
+        .documents
+        .iter()
+        .all(|document| document.event_id != deleted));
+    after.complete().await.expect("complete");
+    assert_eq!(queued(pool, community).await, 0);
+}

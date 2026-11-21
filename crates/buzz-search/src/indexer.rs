@@ -4,9 +4,11 @@
 //! time; when it stops, its lock connection closes and another instance takes
 //! over on its next attempt. Instances that start together spread their
 //! attempts with jitter. The lease holder runs a configurable number of
-//! workers ([`Indexer::with_workers`]); each claims batches of a community no
-//! other worker is indexing, so at most that many bulk requests are in
-//! flight.
+//! workers ([`Indexer::with_workers`]), so at most that many bulk requests
+//! are in flight. Workers can index one community together: each batch
+//! claims a share of the community's queue partitions, and every row of one
+//! event belongs to one partition, so no two batches in flight hold states
+//! of the same message (see `buzz_db::search_outbox`).
 //!
 //! Each batch re-reads its events from Postgres, writes them (or removes the
 //! documents of events that are gone) in one bulk request, and only then
@@ -112,9 +114,8 @@ impl Indexer {
         }
     }
 
-    /// Run `workers` (at least one) batches at once when draining. Each
-    /// works on a different community, so this also bounds the bulk requests
-    /// in flight.
+    /// Run `workers` (at least one) batches at once when draining, of one
+    /// community or several. This also bounds the bulk requests in flight.
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = workers.max(1);
         self
@@ -143,7 +144,15 @@ impl Indexer {
     pub async fn backfill(&self) -> Result<u64, IndexerError> {
         let pool = self.db.pool();
         let mut queued = 0u64;
-        while search_backfill::outbox_below(pool, self.backfill_bound).await? {
+        // With several workers, queue two batches per worker, so each has
+        // full batches and the serial backfill runs less often.
+        let bound = if self.workers > 1 {
+            self.backfill_bound
+                .max(2 * self.workers as i64 * self.batch_size)
+        } else {
+            self.backfill_bound
+        };
+        while search_backfill::outbox_below(pool, bound).await? {
             let Some(step) = search_backfill::step(pool, self.batch_size, &[]).await? else {
                 break;
             };
@@ -244,12 +253,23 @@ impl Indexer {
         let mut skipped: Vec<CommunityId> = Vec::new();
         let mut failure = None;
         while !stop.load(Ordering::Relaxed) {
-            let Some(batch) =
-                search_outbox::claim_batch(self.db.pool(), self.batch_size, &skipped).await?
+            let claimed_at = Instant::now();
+            let Some(batch) = search_outbox::claim_batch_share(
+                self.db.pool(),
+                self.batch_size,
+                &skipped,
+                self.workers,
+            )
+            .await?
             else {
+                debug!(
+                    batches = report.batches,
+                    "search indexer worker found nothing to claim"
+                );
                 break;
             };
             let community = batch.community();
+            let written_at = Instant::now();
             let outcome = match self
                 .index
                 .write(community, &batch.documents, &batch.removed)
@@ -277,7 +297,16 @@ impl Indexer {
                 .iter()
                 .filter(|event| !outcome.failed.contains(event))
                 .count() as u64;
+            let completed_at = Instant::now();
             batch.complete_except(&outcome.failed).await?;
+            debug!(
+                %community,
+                items,
+                claim_ms = (written_at - claimed_at).as_millis() as u64,
+                write_ms = (completed_at - written_at).as_millis() as u64,
+                complete_ms = completed_at.elapsed().as_millis() as u64,
+                "search batch indexed"
+            );
             let label = community.to_string();
             metrics::counter!("buzz_search_indexed_documents_total", "community" => label.clone(), "op" => "write")
                 .increment(written);

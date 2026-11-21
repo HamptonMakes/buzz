@@ -20,15 +20,22 @@
 //! search results. Purging a community's documents from the index is not
 //! queued here: the purge deletes the community's rows, this queue included.
 //!
-//! The indexer drains the queue one community at a time with
-//! [`claim_batch`]: it locks rows, re-reads the events they name (with an
-//! edited message's current text), writes the index, and calls
-//! [`SearchOutboxBatch::complete_except`] to delete exactly the rows it
-//! claimed whose index writes succeeded. Because the indexer re-reads
-//! `events`, the order and number of rows for one event don't matter, and a
-//! change committed while its message's earlier row is being indexed keeps
-//! its own row for the next batch. Only one batch per community runs at a
-//! time, so workers never race to write two states of one message.
+//! The indexer drains the queue with [`claim_batch`]: it locks rows,
+//! re-reads the events they name (with an edited message's current text),
+//! writes the index, and calls [`SearchOutboxBatch::complete_except`] to
+//! delete exactly the rows it claimed whose index writes succeeded. Because
+//! the indexer re-reads `events`, the order and number of rows for one event
+//! don't matter, and a change committed while its message's earlier row is
+//! being indexed keeps its own row for the next batch.
+//!
+//! Several batches of one community can run at once. Each event belongs to
+//! one of [`CLAIM_PARTITIONS`] partitions of its community, by the first byte
+//! of its id, and a batch holds a lock on every partition it claims from
+//! until it completes. So every row naming one event is claimed by at most
+//! one batch at a time, and a later batch re-reads the event only after the
+//! earlier one has written the index and committed: two states of one
+//! message, or a delete and an earlier state, are never written out of
+//! order.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -54,9 +61,18 @@ const KIND_MESSAGE_EDIT: i32 = buzz_core::kind::KIND_STREAM_MESSAGE_EDIT as i32;
 /// indexing a batch of theirs.
 const CLAIM_COMMUNITY_CANDIDATES: usize = 8;
 
-/// First key of the transaction advisory lock a batch holds on its
-/// community; the second is a hash of the community id. Two-key advisory
-/// locks never collide with single-key ones such as the indexer lease.
+/// Partitions of a community's queue. An event's partition is the first
+/// byte of its id modulo this, so it never changes. Batches of one
+/// community run at once only on disjoint partitions, so this caps the
+/// workers one community can use. A power of two dividing 256 keeps the
+/// partitions equal.
+pub const CLAIM_PARTITIONS: i32 = 64;
+
+/// First key of the transaction advisory lock a batch holds on each
+/// partition it claims from; the second is a hash of the community id and
+/// partition. Two-key advisory locks never collide with single-key ones such
+/// as the indexer lease, and a hash collision only makes a claim pass over a
+/// free partition.
 const CLAIM_LOCK_CLASS: i32 = 0x5345_4152;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -228,7 +244,7 @@ impl SearchOutboxBatch {
 
 /// Claim up to `limit` of the oldest queued rows of one community not in
 /// `skip` and not being indexed by another worker, and read their events'
-/// current state.
+/// current state. The batch takes every free partition of the community.
 ///
 /// Returns `None` when no other active community has unclaimed rows.
 pub async fn claim_batch(
@@ -236,6 +252,21 @@ pub async fn claim_batch(
     limit: i64,
     skip: &[CommunityId],
 ) -> Result<Option<SearchOutboxBatch>> {
+    claim_batch_share(pool, limit, skip, 1).await
+}
+
+/// [`claim_batch`] for one of `workers` workers: the batch locks at most
+/// `1/workers` of the community's partitions, picked at random among the
+/// free ones, and claims only their rows, so the other workers can index
+/// the same community at the same time.
+pub async fn claim_batch_share(
+    pool: &PgPool,
+    limit: i64,
+    skip: &[CommunityId],
+    workers: usize,
+) -> Result<Option<SearchOutboxBatch>> {
+    let workers = i32::try_from(workers.max(1)).unwrap_or(CLAIM_PARTITIONS);
+    let share = (CLAIM_PARTITIONS + workers - 1) / workers;
     let mut refused: Vec<Uuid> = skip.iter().map(|community| *community.as_uuid()).collect();
     for _ in 0..CLAIM_COMMUNITY_CANDIDATES {
         // Exclude fenced communities so they cannot occupy the queue head.
@@ -263,32 +294,54 @@ pub async fn claim_batch(
             refused.push(id);
             continue;
         };
-        // One batch per community at a time, so two workers never write
-        // different states of one message in the wrong order. The lock ends
-        // with the batch's transaction.
-        let exclusive: bool =
-            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, hashtext($2::text))")
-                .bind(CLAIM_LOCK_CLASS)
-                .bind(id)
-                .fetch_one(tx.conn())
-                .await?;
-        if !exclusive {
+        // Lock up to `share` free partitions among those of the community's
+        // oldest rows (two batches per worker, since the oldest are mostly
+        // in flight), so no other batch
+        // claims a row of their events until this one completes. Picking
+        // from the queue head keeps claims oldest-first and never settles on
+        // empty partitions while others have rows. The shuffle is fenced
+        // with `OFFSET 0`, so the lock call runs on shuffled partitions one
+        // at a time and stops at the limit; flattened, the planner would
+        // lock every candidate before sorting. The locks end with the
+        // batch's transaction.
+        let partitions: Vec<i32> = sqlx::query_scalar(
+            "SELECT p FROM ( \
+                 SELECT p FROM ( \
+                     SELECT DISTINCT get_byte(event_id, 0) % $3 AS p FROM ( \
+                         SELECT event_id FROM search_outbox WHERE community_id = $2 \
+                         ORDER BY created_at LIMIT $5 \
+                     ) head \
+                 ) candidates ORDER BY random() OFFSET 0 \
+             ) shuffled \
+             WHERE pg_try_advisory_xact_lock($1, hashtext($2::text || '/' || p)) \
+             LIMIT $4",
+        )
+        .bind(CLAIM_LOCK_CLASS)
+        .bind(id)
+        .bind(CLAIM_PARTITIONS)
+        .bind(share)
+        .bind(limit.saturating_mul(2 * i64::from(workers)))
+        .fetch_all(tx.conn())
+        .await?;
+        if partitions.is_empty() {
             refused.push(id);
             continue;
         }
         let rows = sqlx::query(
             "SELECT id, event_id, event_created_at FROM search_outbox \
-             WHERE community_id = $1 \
+             WHERE community_id = $1 AND get_byte(event_id, 0) % $3 = ANY($4) \
              ORDER BY created_at \
              FOR UPDATE SKIP LOCKED \
              LIMIT $2",
         )
         .bind(community.as_uuid())
         .bind(limit)
+        .bind(CLAIM_PARTITIONS)
+        .bind(&partitions)
         .fetch_all(tx.conn())
         .await?;
         if rows.is_empty() {
-            // Another worker holds every row of this community, or its rows
+            // Other workers hold every partition with rows, or the rows
             // were completed since the candidate read.
             refused.push(id);
             continue;

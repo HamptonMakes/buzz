@@ -61,7 +61,7 @@ run on Postgres full-text search; the index is built ahead of switching reads.
 | --- | --- |
 | `BUZZ_OPENSEARCH_URL` | HTTP(S) cluster URL without credentials, query or fragment. Unset disables the outbox and indexer. |
 | `BUZZ_OPENSEARCH_USERNAME`, `BUZZ_OPENSEARCH_PASSWORD` | Optional basic auth. Set both or neither. |
-| `BUZZ_SEARCH_INDEXER_WORKERS` | Indexer workers, and so bulk requests in flight, on the lease holder: 1 to 32, default 1. Backfill is fed from the lease holder alone whatever the count. |
+| `BUZZ_SEARCH_INDEXER_WORKERS` | Indexer workers, and so bulk requests and Postgres transactions in flight, on the lease holder: 1 to 32, default 1. Workers share one community's queue by partition, so a single large community indexes faster too; with more than one, the backfill keeps two batches per worker queued. Backfill is fed from the lease holder alone whatever the count. |
 
 ## Rollout order
 
