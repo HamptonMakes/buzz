@@ -26,8 +26,9 @@
 //! The leader also backfills events stored before the index existed (see
 //! `buzz_db::search_backfill`): before each drain it queues their keys,
 //! newest first, one batch per community in turn, but only while the outbox
-//! holds fewer than the backfill bound. Live rows so wait behind at most that
-//! many backfill rows, and Postgres reads one batch of history at a time. Only
+//! holds fewer than the backfill bound (or, with several workers, two batches
+//! per worker if that is more). Live rows so wait behind at most that many
+//! backfill rows, and Postgres reads one batch of history at a time. Only
 //! the lease holder backfills, so a fleet queues each event once.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -253,7 +254,6 @@ impl Indexer {
         let mut skipped: Vec<CommunityId> = Vec::new();
         let mut failure = None;
         while !stop.load(Ordering::Relaxed) {
-            let claimed_at = Instant::now();
             let Some(batch) = search_outbox::claim_batch_share(
                 self.db.pool(),
                 self.batch_size,
@@ -262,14 +262,9 @@ impl Indexer {
             )
             .await?
             else {
-                debug!(
-                    batches = report.batches,
-                    "search indexer worker found nothing to claim"
-                );
                 break;
             };
             let community = batch.community();
-            let written_at = Instant::now();
             let outcome = match self
                 .index
                 .write(community, &batch.documents, &batch.removed)
@@ -297,16 +292,7 @@ impl Indexer {
                 .iter()
                 .filter(|event| !outcome.failed.contains(event))
                 .count() as u64;
-            let completed_at = Instant::now();
             batch.complete_except(&outcome.failed).await?;
-            debug!(
-                %community,
-                items,
-                claim_ms = (written_at - claimed_at).as_millis() as u64,
-                write_ms = (completed_at - written_at).as_millis() as u64,
-                complete_ms = completed_at.elapsed().as_millis() as u64,
-                "search batch indexed"
-            );
             let label = community.to_string();
             metrics::counter!("buzz_search_indexed_documents_total", "community" => label.clone(), "op" => "write")
                 .increment(written);

@@ -390,3 +390,47 @@ async fn concurrent_claims_of_one_community_never_share_an_event() {
     after.complete().await.expect("complete");
     assert_eq!(queued(pool, community).await, 0);
 }
+
+/// A worker whose share of the queue head is held by another batch still
+/// claims rows from the other partitions, instead of coming back empty and
+/// leaving the drain while rows remain.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_claim_looks_past_a_held_queue_head() {
+    let db = connect().await;
+    let pool = db.pool();
+    search_outbox::enable(pool).await.expect("enable outbox");
+    let community = create_community(pool).await;
+    let keys = Keys::generate();
+    let partition =
+        |event: &Event| i32::from(event.id.as_bytes()[0]) % search_outbox::CLAIM_PARTITIONS;
+    // With batches of 1 among 2 workers, the head is the oldest 4 rows.
+    let mut head = std::collections::BTreeSet::new();
+    for n in 0..4 {
+        let event = signed(&keys, 9, &format!("head {n}"), vec![]);
+        head.insert(partition(&event));
+        db.insert_event(community, &event, None)
+            .await
+            .expect("insert");
+    }
+    let behind = (0..)
+        .map(|n| signed(&keys, 9, &format!("behind {n}"), vec![]))
+        .find(|event| !head.contains(&partition(event)))
+        .expect("an event outside the head's partitions");
+    db.insert_event(community, &behind, None)
+        .await
+        .expect("insert");
+
+    let first = search_outbox::claim_batch_share(pool, 1, &[], 2)
+        .await
+        .expect("claim")
+        .expect("a batch");
+    let second = search_outbox::claim_batch_share(pool, 1, &[], 2)
+        .await
+        .expect("claim")
+        .expect("a batch from past the held head");
+    assert_eq!(second.documents.len(), 1);
+    assert_eq!(second.documents[0].event_id, *behind.id.as_bytes());
+    drop(second);
+    drop(first);
+}

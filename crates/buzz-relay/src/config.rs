@@ -312,8 +312,9 @@ pub struct Config {
     pub opensearch: Option<buzz_search::opensearch::OpenSearchConfig>,
 
     /// Search indexer workers on the lease-holding instance
-    /// (`BUZZ_SEARCH_INDEXER_WORKERS`, default 1): how many bulk requests it
-    /// keeps in flight, each for a different community.
+    /// (`BUZZ_SEARCH_INDEXER_WORKERS`, default 1): how many bulk requests,
+    /// each holding a database connection, it keeps in flight. Workers can
+    /// share one community's queue.
     pub search_indexer_workers: usize,
 
     /// Allow NIP-OA owner attestation for relay membership.

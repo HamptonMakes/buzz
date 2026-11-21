@@ -15,10 +15,15 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   lock). Instances that start together spread their lease attempts with
   jitter, and followers check the lease every 2.5 to 5 seconds. The lease
   holder runs `BUZZ_SEARCH_INDEXER_WORKERS` workers. Each claims a batch of
-  one community's rows (no two workers index the same community at once),
-  re-reads those events, writes or removes their documents in one bulk
-  request, and deletes the claimed rows whose items succeeded. So at most
-  that many bulk requests are in flight. A message is indexed with the text
+  one community's rows, re-reads those events, writes or removes their
+  documents in one bulk request, and deletes the claimed rows whose items
+  succeeded. So at most that many bulk requests are in flight. Workers can
+  index one community together: its queue is split into 64 partitions by
+  event id, and a batch claims only rows of partitions no other batch holds,
+  so two states of one message are never written out of order. Each worker
+  holds a Postgres transaction, from the relay's main pool
+  (`BUZZ_DB_POOL_SIZE`), for the length of its bulk request, so leave the
+  pool room for the worker count on top of serving traffic. A message is indexed with the text
   of its latest live edit; a deleted or scrubbed message has its document
   removed. A change committed while its message's earlier row is being
   indexed keeps its own row and is indexed afterwards.
@@ -37,8 +42,9 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   of 500, newest first, and records how far it got in `search_backfill`
   in the same transaction, so a restart resumes below the last batch.
   Communities take turns one batch each. It queues only while the outbox
-  holds fewer than 2,000 rows, so live messages wait behind at most that
-  many backfill rows. Backfill goes through the same outbox and indexer as
+  holds fewer than 2,000 rows, or two batches per worker (1,000 rows a
+  worker) when that is more, so live messages wait behind at most that many
+  backfill rows: 2,000 for up to two workers, 8,000 at eight. Backfill goes through the same outbox and indexer as
   live writes, and queuing an indexed message again only rewrites its
   document. A community's backfill is complete when a batch comes back
   short; new communities backfill once, cheaply. To backfill a community
@@ -61,7 +67,7 @@ run on Postgres full-text search; the index is built ahead of switching reads.
 | --- | --- |
 | `BUZZ_OPENSEARCH_URL` | HTTP(S) cluster URL without credentials, query or fragment. Unset disables the outbox and indexer. |
 | `BUZZ_OPENSEARCH_USERNAME`, `BUZZ_OPENSEARCH_PASSWORD` | Optional basic auth. Set both or neither. |
-| `BUZZ_SEARCH_INDEXER_WORKERS` | Indexer workers, and so bulk requests and Postgres transactions in flight, on the lease holder: 1 to 32, default 1. Workers share one community's queue by partition, so a single large community indexes faster too; with more than one, the backfill keeps two batches per worker queued. Backfill is fed from the lease holder alone whatever the count. |
+| `BUZZ_SEARCH_INDEXER_WORKERS` | Indexer workers, and so bulk requests and Postgres connections held in flight, on the lease holder: 1 to 32, default 1. Workers share one community's queue by partition, so a single large community indexes faster too. With more than one, the backfill keeps two batches per worker queued, so live rows can wait behind that many backfill rows. Backfill is fed from the lease holder alone whatever the count. |
 
 ## Rollout order
 

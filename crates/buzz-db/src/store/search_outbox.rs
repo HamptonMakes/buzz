@@ -244,7 +244,9 @@ impl SearchOutboxBatch {
 
 /// Claim up to `limit` of the oldest queued rows of one community not in
 /// `skip` and not being indexed by another worker, and read their events'
-/// current state. The batch takes every free partition of the community.
+/// current state. The batch may take every free partition of the
+/// community's queue head, so this suits a single worker; see
+/// [`claim_batch_share`].
 ///
 /// Returns `None` when no other active community has unclaimed rows.
 pub async fn claim_batch(
@@ -256,9 +258,12 @@ pub async fn claim_batch(
 }
 
 /// [`claim_batch`] for one of `workers` workers: the batch locks at most
-/// `1/workers` of the community's partitions, picked at random among the
-/// free ones, and claims only their rows, so the other workers can index
-/// the same community at the same time.
+/// `ceil(64 / workers)` of the community's partitions, picked at random
+/// among the free ones holding its oldest rows, and claims only their rows,
+/// so the other workers can index the same community at the same time.
+/// Every row of one event is in one partition, and the partition stays
+/// locked until the batch completes, so no two batches in flight hold rows
+/// of the same event.
 pub async fn claim_batch_share(
     pool: &PgPool,
     limit: i64,
@@ -295,34 +300,43 @@ pub async fn claim_batch_share(
             continue;
         };
         // Lock up to `share` free partitions among those of the community's
-        // oldest rows (two batches per worker, since the oldest are mostly
-        // in flight), so no other batch
-        // claims a row of their events until this one completes. Picking
-        // from the queue head keeps claims oldest-first and never settles on
-        // empty partitions while others have rows. The shuffle is fenced
-        // with `OFFSET 0`, so the lock call runs on shuffled partitions one
-        // at a time and stops at the limit; flattened, the planner would
-        // lock every candidate before sorting. The locks end with the
-        // batch's transaction.
-        let partitions: Vec<i32> = sqlx::query_scalar(
-            "SELECT p FROM ( \
-                 SELECT p FROM ( \
-                     SELECT DISTINCT get_byte(event_id, 0) % $3 AS p FROM ( \
-                         SELECT event_id FROM search_outbox WHERE community_id = $2 \
-                         ORDER BY created_at LIMIT $5 \
-                     ) head \
-                 ) candidates ORDER BY random() OFFSET 0 \
-             ) shuffled \
-             WHERE pg_try_advisory_xact_lock($1, hashtext($2::text || '/' || p)) \
-             LIMIT $4",
-        )
-        .bind(CLAIM_LOCK_CLASS)
-        .bind(id)
-        .bind(CLAIM_PARTITIONS)
-        .bind(share)
-        .bind(limit.saturating_mul(2 * i64::from(workers)))
-        .fetch_all(tx.conn())
-        .await?;
+        // oldest rows, so no other batch claims a row of their events until
+        // this one completes. The head is two batches per worker, since the
+        // oldest rows are mostly in flight; picking from it keeps claims
+        // oldest-first and off empty partitions. A worker that has run ahead
+        // of the others can find every partition of the head held, so it
+        // looks once more over a head sixteen times as long: otherwise its
+        // claim comes back empty while rows remain, and the drain retires it.
+        // The shuffle is fenced with `OFFSET 0`, so the lock call runs on
+        // shuffled partitions one at a time and stops at the limit;
+        // flattened, the planner would lock every candidate before sorting.
+        // The locks end with the batch's transaction.
+        let head = limit.saturating_mul(2 * i64::from(workers));
+        let mut partitions: Vec<i32> = Vec::new();
+        for window in [head, head.saturating_mul(16)] {
+            partitions = sqlx::query_scalar(
+                "SELECT p FROM ( \
+                     SELECT p FROM ( \
+                         SELECT DISTINCT get_byte(event_id, 0) % $3 AS p FROM ( \
+                             SELECT event_id FROM search_outbox WHERE community_id = $2 \
+                             ORDER BY created_at LIMIT $5 \
+                         ) head \
+                     ) candidates ORDER BY random() OFFSET 0 \
+                 ) shuffled \
+                 WHERE pg_try_advisory_xact_lock($1, hashtext($2::text || '/' || p)) \
+                 LIMIT $4",
+            )
+            .bind(CLAIM_LOCK_CLASS)
+            .bind(id)
+            .bind(CLAIM_PARTITIONS)
+            .bind(share)
+            .bind(window)
+            .fetch_all(tx.conn())
+            .await?;
+            if !partitions.is_empty() {
+                break;
+            }
+        }
         if partitions.is_empty() {
             refused.push(id);
             continue;
