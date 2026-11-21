@@ -331,7 +331,13 @@ async fn stems_match_below_the_exact_form() {
 #[ignore = "requires Postgres and OpenSearch"]
 async fn prefix_mode_completes_the_last_word_but_not_long_tokens() {
     let (pool, fx, c) = setup().await;
-    let planning = post(&pool, c, "project planning milestone", DAY).await;
+    let planning = post(
+        &pool,
+        c,
+        "project planning milestone transcontinentalrailways",
+        DAY,
+    )
+    .await;
     let archive = post(&pool, c, "project archive", DAY).await;
     let npub = format!("npub1{}", "q".repeat(58));
     let hex = "a3f9b2c4".repeat(8);
@@ -350,6 +356,11 @@ async fn prefix_mode_completes_the_last_word_but_not_long_tokens() {
     assert!(
         ranked(&fx, c, "pro", SearchMode::FullText).await.is_empty(),
         "full text does not complete words"
+    );
+    assert_eq!(
+        prefix("transcontinentalrailw").await,
+        vec![planning],
+        "a partial word longer than the longest prefix matches by its start"
     );
     assert_eq!(prefix("roadm").await, vec![machine]);
     assert!(prefix("npub1qqq").await.is_empty(), "no prefixes of a key");

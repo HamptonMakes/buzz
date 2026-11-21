@@ -26,9 +26,10 @@
 //! **Prefixes** ([`prefix_mapping`] and [`prefix_query`], the only two places
 //! to change to use `index_prefixes` instead): edge n-grams of
 //! [`MIN_PREFIX`] to [`MAX_PREFIX`] characters, of tokens up to
-//! [`LONG_TOKEN`] characters. Longer tokens (`nostr:` URIs, keys, hashes, ids)
-//! get none: nobody types them a letter at a time, and each would add dozens
-//! of prefixes.
+//! [`LONG_TOKEN`] characters. Longer tokens (`nostr:` URIs, keys, hashes,
+//! ids) get none: nobody types them a letter at a time, and each would add
+//! dozens of prefixes. The searched word is cut to [`MAX_PREFIX`]
+//! characters, so a longer partial word matches by its start.
 //!
 //! **Query match (Q)**, BM25 with its length normalization on:
 //! - each query word must match in one of three ways, scored by the best:
@@ -56,7 +57,7 @@
 //! **Serverless.** Built-in analysis only (no ICU plugin), `rescore` with a
 //! `function_score` `exp` decay, and no scripts. Each still has to be checked
 //! on a real Serverless collection: `word_delimiter_graph`, `edge_ngram`,
-//! `length`, the `light_english` stemmer, `rescore`, and `function_score`
+//! `length`, `truncate`, the `light_english` stemmer, `rescore`, and `function_score`
 //! decay inside it.
 
 use serde_json::{json, Value};
@@ -107,6 +108,7 @@ pub(super) fn analysis() -> Value {
             },
             "short_tokens": { "type": "length", "max": LONG_TOKEN },
             "prefixes": { "type": "edge_ngram", "min_gram": MIN_PREFIX, "max_gram": MAX_PREFIX },
+            "longest_prefix": { "type": "truncate", "length": MAX_PREFIX },
             "light_stem": { "type": "stemmer", "language": "light_english" }
         },
         "analyzer": {
@@ -116,7 +118,8 @@ pub(super) fn analysis() -> Value {
             "message_stem_search": analyzer(&["lowercase", "asciifolding", "light_stem"]),
             "message_prefix": analyzer(&[
                 "word_parts", "lowercase", "asciifolding", "short_tokens", "prefixes"
-            ])
+            ]),
+            "message_prefix_search": analyzer(&["lowercase", "asciifolding", "longest_prefix"])
         }
     })
 }
@@ -148,7 +151,7 @@ fn prefix_mapping() -> Value {
     json!({
         "type": "text",
         "analyzer": "message_prefix",
-        "search_analyzer": "message_search",
+        "search_analyzer": "message_prefix_search",
         "index_options": "freqs"
     })
 }
