@@ -360,3 +360,24 @@ fn bytes32(bytes: Vec<u8>) -> Result<[u8; 32]> {
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| crate::DbError::InvalidData(format!("expected 32 bytes, got {}", bytes.len())))
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replacing a replaceable or addressable event soft-deletes its previous
+    /// version without queuing a row. That is correct only while no such kind
+    /// is searchable or a message edit; adding one needs the replacement paths
+    /// to queue the superseded version too.
+    #[test]
+    fn searchable_kinds_are_regular_events() {
+        for kind in SEARCHABLE_KINDS.into_iter().chain([KIND_MESSAGE_EDIT]) {
+            let nostr_kind = nostr::Kind::from(kind as u16);
+            assert!(
+                !nostr_kind.is_replaceable()
+                    && !nostr_kind.is_addressable()
+                    && !nostr_kind.is_ephemeral(),
+                "kind {kind} is replaceable, addressable or ephemeral"
+            );
+        }
+    }
+}
