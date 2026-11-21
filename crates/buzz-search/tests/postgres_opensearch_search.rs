@@ -217,8 +217,12 @@ async fn the_indexer_lease_hands_over() {
     let keys = Keys::generate();
     let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
 
+    // Both are signed now, a second apart, so the newest-first order the
+    // assertion expects does not depend on how long the handover takes.
+    let before = message_at(&keys, "leaseword before", -1);
+    let after = message_at(&keys, "leaseword after", 0);
+
     let first = tokio::spawn(Indexer::new(db.clone(), index.clone()).run());
-    let before = message(&keys, "leaseword before");
     db.insert_event(community, &before, None)
         .await
         .expect("insert");
@@ -228,7 +232,6 @@ async fn the_indexer_lease_hands_over() {
     let second = tokio::spawn(Indexer::new(db.clone(), index.clone()).run());
     first.abort();
     let _ = first.await;
-    let after = message(&keys, "leaseword after");
     db.insert_event(community, &after, None)
         .await
         .expect("insert");
