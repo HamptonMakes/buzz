@@ -434,12 +434,12 @@ fn document_source(community: CommunityId, document: &SearchDocument) -> Value {
 }
 
 /// The request body of a search: filters on the community first, then on
-/// scope, kinds, authors and time; `text_match` decides what matches and its
-/// Q. Relevance order is Q times the age factor at `now`; newest order is by
+/// scope, kinds, authors and time; `text` decides what matches and its Q.
+/// Relevance order is Q times the age factor at `now`; newest order is by
 /// time alone.
 fn search_body(
     query: &SearchQuery,
-    text_match: Value,
+    text: relevance::TextQuery,
     offset: i64,
     per_page: u32,
     now: i64,
@@ -479,12 +479,12 @@ fn search_body(
         // No hit count: counting would visit every match.
         "track_total_hits": false,
         "_source": ["event_id", "kind", "author", "channel", "created_at"],
-        "query": { "bool": { "filter": filter, "must": [text_match] } },
+        "query": { "bool": { "filter": filter, "must": [text.matched.clone()] } },
     });
     match query.sort {
         // A rescore cannot follow a sort, so ties keep the engine's order;
         // the age factor already puts the newer of two equal matches first.
-        SearchSort::Relevance => body["rescore"] = relevance::age_rescore(now),
+        SearchSort::Relevance => body["rescore"] = relevance::rescore(&text, now),
         SearchSort::Newest => {
             body["sort"] = json!([{ "created_at": "desc" }, { "event_id": "asc" }]);
             body["track_scores"] = json!(true);

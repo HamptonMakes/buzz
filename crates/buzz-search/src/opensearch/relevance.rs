@@ -37,7 +37,11 @@
 //!   ([`PREFIX_WEIGHT`]) and is never corrected;
 //! - the words are OR-ed with a minimum ([`MIN_WORDS_MATCHED`]);
 //! - an exact phrase ([`PHRASE_WEIGHT`]) and the words close together
-//!   ([`PROXIMITY_WEIGHT`]) add a bonus.
+//!   ([`PROXIMITY_WEIGHT`]) add a bonus, scored for the top
+//!   [`RESCORE_WINDOW`] hits by the words alone. Phrase matching reads the
+//!   positions of every message holding all the words, so in the main query
+//!   it cost 55 ms for two common words on a million messages, against 22 ms
+//!   in the window, and grows with the history.
 //!
 //! Typo matching is one clause, [`typo_clause`]: dropping it, for example for
 //! a separate spell checker, leaves the rest as it is.
@@ -168,8 +172,17 @@ fn typo_clause(word: &str) -> Value {
     } } })
 }
 
+/// A search's text: what matches, and the phrase bonus for a
+/// [`rescore`].
+pub(super) struct TextQuery {
+    /// The words: which messages match, and their Q before any bonus.
+    pub(super) matched: Value,
+    /// The phrase and proximity bonus, for queries of two words or more.
+    bonus: Option<Value>,
+}
+
 /// The text query for `text` in `mode`, or `None` if it has no words.
-pub(super) fn text_query(text: &str, mode: SearchMode) -> Option<Value> {
+pub(super) fn text_query(text: &str, mode: SearchMode) -> Option<TextQuery> {
     // A punctuation-only word analyzes to nothing and would count against
     // the minimum without ever matching.
     let words: Vec<&str> = text
@@ -192,7 +205,10 @@ pub(super) fn text_query(text: &str, mode: SearchMode) -> Option<Value> {
         "minimum_should_match": MIN_WORDS_MATCHED
     } });
     if words.len() < 2 {
-        return Some(matched);
+        return Some(TextQuery {
+            matched,
+            bonus: None,
+        });
     }
     let phrase = words.join(" ");
     let phrase_query = match mode {
@@ -200,10 +216,12 @@ pub(super) fn text_query(text: &str, mode: SearchMode) -> Option<Value> {
         SearchMode::Prefix => "match_phrase_prefix",
     };
     let bonus = |slop: u32, boost: f64| json!({ phrase_query: { "content": { "query": phrase, "slop": slop, "boost": boost } } });
-    Some(json!({ "bool": {
-        "must": [matched],
-        "should": [bonus(0, PHRASE_WEIGHT), bonus(PROXIMITY_SLOP, PROXIMITY_WEIGHT)]
-    } }))
+    Some(TextQuery {
+        matched,
+        bonus: Some(json!({ "bool": {
+            "should": [bonus(0, PHRASE_WEIGHT), bonus(PROXIMITY_SLOP, PROXIMITY_WEIGHT)]
+        } })),
+    })
 }
 
 /// One query word, matched exactly, by stem or with a typo, scored by the
@@ -226,9 +244,25 @@ fn stem_clause(word: &str) -> Value {
     } } })
 }
 
-/// The rescore multiplying each of the top [`RESCORE_WINDOW`] hits' Q by its
-/// age factor at `now` (Unix seconds); see [`age_factor`].
-pub(super) fn age_rescore(now: i64) -> Value {
+/// The rescores of a relevance search over the top [`RESCORE_WINDOW`] hits:
+/// add `text`'s phrase bonus to their Q, then multiply it by the age factor
+/// at `now` (Unix seconds); see [`age_factor`].
+pub(super) fn rescore(text: &TextQuery, now: i64) -> Value {
+    let bonus = text.bonus.as_ref().map(|bonus| {
+        json!({
+            "window_size": RESCORE_WINDOW,
+            "query": {
+                "rescore_query": bonus,
+                "query_weight": 1.0,
+                "rescore_query_weight": 1.0,
+                "score_mode": "total"
+            }
+        })
+    });
+    Value::Array(bonus.into_iter().chain([age_rescore(now)]).collect())
+}
+
+fn age_rescore(now: i64) -> Value {
     json!({
         "window_size": RESCORE_WINDOW,
         "query": {
@@ -256,7 +290,7 @@ pub(super) fn age_rescore(now: i64) -> Value {
 }
 
 /// T for a message created at `created_at`, at `now` (both Unix seconds):
-/// what [`age_rescore`] multiplies by. A message from the future (clock
+/// what [`rescore`] multiplies by. A message from the future (clock
 /// skew) decays as if as old.
 pub(super) fn age_factor(created_at: i64, now: i64) -> f64 {
     let age_days = (now - created_at).unsigned_abs() as f64 / 86_400.0;
