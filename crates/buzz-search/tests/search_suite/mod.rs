@@ -107,11 +107,24 @@ pub struct Searcher<'a> {
 impl Searcher<'_> {
     /// [`SearchService::search`], once the backend has caught up.
     pub async fn search(&self, query: &SearchQuery) -> Result<SearchResult, SearchError> {
+        self.catch_up().await;
+        self.fixture.service.search(query).await
+    }
+
+    /// [`SearchService::search_scored`], once the backend has caught up.
+    pub async fn search_scored(
+        &self,
+        query: &SearchQuery,
+    ) -> Result<buzz_search::ScoredResult, SearchError> {
+        self.catch_up().await;
+        self.fixture.service.search_scored(query).await
+    }
+
+    async fn catch_up(&self) {
         if let Some((indexer, index)) = &self.fixture.opensearch {
             indexer.drain().await.expect("drain the search outbox");
             index.refresh().await.expect("refresh the test index");
         }
-        self.fixture.service.search(query).await
     }
 }
 

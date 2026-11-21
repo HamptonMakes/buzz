@@ -15,12 +15,8 @@
 //! there. Without an OpenSearch address the relay builds a
 //! [`crate::SearchService`] with no OpenSearch backend and never reads it.
 //!
-//! **Unsupported queries.** OpenSearch serves word mode only until prefix
-//! analysis lands (issue 06). A prefix-mode search is served by Postgres at
-//! every setting and counted in `buzz_search_opensearch_skipped_total`
-//! (`reason="unsupported_mode"`). That is a routing rule known before the
-//! search runs, not a fallback: an OpenSearch failure at setting 2 still fails
-//! the search.
+//! Both search modes run on either backend. An OpenSearch failure at setting
+//! 2 fails the search: there is no fallback to Postgres.
 //!
 //! **Shadow.** Only first pages are compared. The OpenSearch query starts
 //! before the Postgres one, on its own task with its own deadline
@@ -53,7 +49,7 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
 use crate::opensearch::SearchIndex;
-use crate::{SearchError, SearchMode, SearchQuery, SearchResult};
+use crate::{SearchError, SearchQuery, SearchResult};
 
 /// Integer flag choosing the search backend per community; see the module
 /// docs. Environment form: `BUZZ_FEATURE_FLAG_SEARCH_BACKEND`.
@@ -184,14 +180,16 @@ impl OpenSearchBackend {
         self.shadow_deadline = deadline;
     }
 
+    /// The index serving `community`'s searches, if the setting is
+    /// OpenSearch.
+    pub(crate) fn serving(&self, community: CommunityId) -> Option<&SearchIndex> {
+        (self.selection.setting(community) == BackendSetting::OpenSearch).then_some(&self.index)
+    }
+
     /// Decide where `query` runs, starting the shadow search if it gets one.
     pub(crate) fn route(&self, query: &SearchQuery) -> Route<'_> {
         let setting = self.selection.setting(query.community);
         if setting == BackendSetting::Postgres {
-            return Route::Postgres;
-        }
-        if query.mode != SearchMode::FullText {
-            skipped(setting, "unsupported_mode");
             return Route::Postgres;
         }
         if setting == BackendSetting::OpenSearch {

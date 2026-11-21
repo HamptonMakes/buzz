@@ -759,25 +759,28 @@ async fn outbox_gauges_follow_a_paused_and_resumed_indexer() {
     .await;
 }
 
-/// Prefix mode, which OpenSearch does not serve yet, stays on Postgres at
-/// every value and is counted: shadow skips the comparison, and 2 serves it
-/// from Postgres. Not a fallback: OpenSearch is never tried.
-/// Mutation: route prefix searches like word searches → RED (the cluster is
-/// contacted, and at 2 the search fails).
+/// Prefix mode follows the flag like word searches: at 1 Postgres serves
+/// and OpenSearch shadows it, at 2 OpenSearch serves.
+/// Mutation: keep prefix searches on Postgres → RED (no shadow search at 1,
+/// and at 2 the OpenSearch-only word finds nothing).
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires Postgres and Redis"]
-async fn prefix_searches_stay_on_postgres_and_are_counted() {
+#[ignore = "requires Postgres, Redis and OpenSearch"]
+async fn prefix_searches_follow_the_flag() {
     let recorder = DebuggingRecorder::new();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut recorded = Recorded::new(&recorder);
-    let cluster = FakeCluster::start(true).await;
-    let f = Fixture::new(cluster.index.clone(), Duration::from_secs(1)).await;
+    let f = Fixture::on_opensearch().await;
     let c = f.community().await;
-    let needle = word("prefixed");
-    let message = f.post(&c, c.private, &needle).await;
-    let query = buzz_search::SearchQuery {
+
+    // Postgres holds `pg_word`; the index holds the message under `os_word`.
+    // Both stay short enough for the index to keep their prefixes.
+    let pg_word = word("prefixpg")[..16].to_owned();
+    let os_word = word("prefixos")[..16].to_owned();
+    let message = f.post(&c, c.private, &pg_word).await;
+    f.index_as(&c, &message, &os_word, c.private).await;
+    let query = |word: &str| buzz_search::SearchQuery {
         community: c.tenant.community(),
-        q: needle[..12].to_owned(),
+        q: word[..12].to_owned(),
         channel_scope: buzz_search::ChannelScope::Channels(vec![c.private]),
         kinds: Some(vec![9]),
         authors: None,
@@ -788,25 +791,34 @@ async fn prefix_searches_stay_on_postgres_and_are_counted() {
         mode: buzz_search::SearchMode::Prefix,
         sort: buzz_search::SearchSort::Relevance,
     };
+    let found = |hits: buzz_search::SearchResult| {
+        hits.hits.iter().map(|hit| hit.event_id).collect::<Vec<_>>()
+    };
 
-    for (value, setting) in [(1, "shadow"), (2, "opensearch")] {
-        f.set_backend(&c, value);
-        let hits = f.state.search.search(&query).await.expect("search");
-        assert_eq!(
-            hits.hits.iter().map(|hit| hit.event_id).collect::<Vec<_>>(),
-            vec![message.id.to_bytes()],
-            "{setting}"
-        );
-        recorded.collect();
-        assert_eq!(
-            recorded.counter(
-                "buzz_search_opensearch_skipped_total",
-                &[("setting", setting), ("reason", "unsupported_mode")]
-            ),
-            1,
-            "{setting}"
-        );
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(cluster.connections(), 0);
+    f.set_backend(&c, 1);
+    let hits = f
+        .state
+        .search
+        .search(&query(&pg_word))
+        .await
+        .expect("search");
+    assert_eq!(found(hits), vec![message.id.to_bytes()], "Postgres serves");
+    recorded.wait_for_shadows(1).await;
+    assert_eq!(recorded.requests("opensearch", "shadow", "zero_results"), 1);
+
+    f.set_backend(&c, 2);
+    let hits = f
+        .state
+        .search
+        .search(&query(&os_word))
+        .await
+        .expect("search");
+    assert_eq!(
+        found(hits),
+        vec![message.id.to_bytes()],
+        "OpenSearch serves"
+    );
+    recorded.collect();
+    assert_eq!(recorded.requests("opensearch", "primary", "hits"), 1);
+    f.delete().await;
 }

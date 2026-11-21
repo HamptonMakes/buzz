@@ -56,6 +56,15 @@ shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-se
   and never create an index, so a deleted index is recreated with its mapping
   on the next attempt. Documents hold the message
   text in an indexed field only; `_source` does not store it.
+- The index name carries its mapping version (`buzz-messages-v2`) and the
+  alias `buzz-messages` points at it. A relay never writes into an index of
+  another version: if the alias points elsewhere, every pass fails with
+  `search indexing failed` naming the index the alias points at, nothing is
+  indexed and the outbox grows. To move to a new version, delete the old index
+  (`DELETE /buzz-messages-v1`) and run `DELETE FROM search_backfill`: the
+  leader creates the new index and backfills every community again. Keep
+  `search.backend` at `0` until the backfill completes, because searches
+  find only what has been indexed so far.
 - Community deletion fences and purges `search_outbox` and `search_backfill`
   with the community's other rows. It does not yet remove the community's documents from the
   index. Every search filters on the community, and a deleted community's id
@@ -120,9 +129,8 @@ backend for each community, read on every search:
 
 Without `BUZZ_OPENSEARCH_URL` the flag is ignored and Postgres serves. Every
 hit is still re-read from Postgres and access-checked at every value.
-Prefix-mode searches (the bridge's `search_mode: "prefix"`) stay on Postgres
-at every value until OpenSearch supports prefix analysis; they are counted in
-`buzz_search_opensearch_skipped_total{reason="unsupported_mode"}`.
+Word and prefix-mode searches (the bridge's `search_mode: "prefix"`) follow
+the flag alike.
 
 The flag comes from the relay's feature-flag provider
 (`BUZZ_FEATURE_FLAGS_PROVIDER`). LaunchDarkly can target one community (the
@@ -141,7 +149,7 @@ BUZZ_FEATURE_FLAGS_PROVIDER=environment BUZZ_FEATURE_FLAG_SEARCH_BACKEND=1 just 
 | `buzz_search_duration_seconds{backend, role}` | Search latency per backend; `role` is `primary` (served the request) or `shadow`. |
 | `buzz_search_requests_total{backend, role, outcome}` | `outcome`: `hits`, `zero_results` (first page empty), `empty_page` (later page empty), `error` (including failed shards and engine timeouts), `timeout` (shadow deadline). Zero-result rate is `zero_results` over first-page searches. |
 | `buzz_search_shadow_overlap_ratio` | Share of the top 10 hits both backends returned, over the larger list. |
-| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `unsupported_mode`, or `shadow_busy` when 32 shadow searches were already in flight. |
+| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `shadow_busy` when 32 shadow searches were already in flight. |
 | `buzz_search_outbox_depth` | Queued outbox rows (counted up to 1,000,000), sampled every 15 s. |
 | `buzz_search_index_lag_seconds` | Age of the oldest queued outbox row; `0` when the queue is empty. |
 
