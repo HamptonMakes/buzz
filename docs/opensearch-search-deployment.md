@@ -8,11 +8,16 @@ run on Postgres full-text search; the index is built ahead of switching reads.
 - Admission writes a `search_outbox` row in the same transaction as each
   stored event of a searchable kind (9, 40002, 40008, 45001, 45003). A
   rolled-back write queues nothing, and admission never calls OpenSearch.
+  Deletions (NIP-09, NIP-29 and moderation) and account-deletion scrubs queue
+  a row for each removed message the same way. A message edit (kind 40003),
+  or a deletion of one, queues the message it edits.
 - One relay instance holds the indexer lease (a Postgres session advisory
   lock). It claims a batch of one community's rows, re-reads those events,
   writes or removes their documents in one bulk request, and deletes the rows
-  it claimed. A failed request leaves the rows queued; the indexer retries with
-  backoff capped at 60 seconds. A batch the cluster rejects outright (HTTP 400
+  it claimed. A message is indexed with the text of its latest live edit; a
+  deleted or scrubbed message has its document removed. A failed request
+  leaves the rows queued; the indexer retries with backoff capped at 60
+  seconds. A batch the cluster rejects outright (HTTP 400
   or 413) skips its community for that pass, so other communities keep
   indexing.
 - The index (`buzz-messages`) is created by the leader on its first attempt,
@@ -21,7 +26,10 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   on the next attempt. Documents hold the message
   text in an indexed field only; `_source` does not store it.
 - Community deletion fences and purges `search_outbox` with the community's
-  other rows.
+  other rows. It does not yet remove the community's documents from the
+  index. Every search filters on the community, and a deleted community's id
+  is never reused, so those documents never match a search, but their words
+  stay in the index.
 
 ## Settings
 

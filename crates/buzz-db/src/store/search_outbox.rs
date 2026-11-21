@@ -1,18 +1,31 @@
-//! The search outbox: the durable queue between event admission and the
-//! search index.
+//! The search outbox: the durable queue between Postgres and the search
+//! index.
 //!
 //! When [`enable`] has been called (the relay does so when it is configured
-//! with an OpenSearch address), every admitted insert of a
-//! [`SEARCHABLE_KINDS`] event writes a `search_outbox` row in the same
-//! transaction, so a stored message always has its index change queued and a
-//! rolled-back write never does. The write makes no call to the search
-//! engine.
+//! with an OpenSearch address), every write that changes what search should
+//! return queues a `search_outbox` row in the same transaction, so a change
+//! always has its index update queued and a rolled-back write never does. The
+//! write makes no call to the search engine. Those writes are:
+//!
+//! - admitting a [`SEARCHABLE_KINDS`] event (through the event insert
+//!   follow-up);
+//! - admitting or deleting a message edit, which queues the message it edits;
+//! - soft-deleting an event (NIP-09 and NIP-29 deletions, moderation);
+//! - account deletion scrubbing or erasing an author's messages.
+//!
+//! A source-policy test in `tests/observability_source.rs` fails when a new
+//! production `UPDATE events` or `DELETE FROM events` neither queues a row
+//! nor is listed as never touching a searchable kind. Replaceable and
+//! addressable kinds are never searchable, so replacing one never changes
+//! search results. Purging a community's documents from the index is not
+//! queued here: the purge deletes the community's rows, this queue included.
 //!
 //! The indexer drains the queue one community at a time with
 //! [`claim_batch`]: it locks rows other workers don't hold, re-reads the
-//! events they name, writes the index, and calls [`SearchOutboxBatch::complete`]
-//! to delete exactly the rows it claimed. Because the indexer re-reads
-//! `events`, the order and number of rows for one event don't matter.
+//! events they name (with an edited message's current text), writes the
+//! index, and calls [`SearchOutboxBatch::complete`] to delete exactly the
+//! rows it claimed. Because the indexer re-reads `events`, the order and
+//! number of rows for one event don't matter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,10 +36,15 @@ use uuid::Uuid;
 
 use crate::{AdmittedTx, Result};
 
-/// Event kinds the search index holds; no other kind is ever queued. Stream
+/// Event kinds the search index holds; no other kind is ever indexed. Stream
 /// messages (9), their v2 and forum forms (40002, 40008), and workflow
-/// messages (45001, 45003).
+/// messages (45001, 45003). These are also the kinds a message edit applies
+/// to.
 pub const SEARCHABLE_KINDS: [i32; 5] = [9, 40002, 40008, 45001, 45003];
+
+/// A message edit: its content replaces the text of the message its first
+/// valid `e` tag names, in the same channel.
+const KIND_MESSAGE_EDIT: i32 = buzz_core::kind::KIND_STREAM_MESSAGE_EDIT as i32;
 
 /// Communities a claim may pass over because their deletion fenced them
 /// between candidate selection and admission, or another worker holds all
@@ -55,25 +73,74 @@ pub async fn enable(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Queue `event_id` for indexing in the admitted transaction that inserted it.
+/// Queue the index change for an event this admitted transaction inserted,
+/// soft-deleted or otherwise changed: the event itself when it is
+/// searchable, or the message it edits when it is a message edit.
+///
+/// Call while the event's row still exists, before any physical delete in the
+/// same transaction.
 pub(crate) async fn enqueue_in_transaction(
     tx: &mut AdmittedTx,
     event_id: &[u8],
     created_at: DateTime<Utc>,
     kind: i32,
 ) -> Result<()> {
-    if !ENABLED.load(Ordering::Relaxed) || !SEARCHABLE_KINDS.contains(&kind) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if SEARCHABLE_KINDS.contains(&kind) {
+        let community = tx.community();
+        sqlx::query(
+            "INSERT INTO search_outbox (community_id, event_id, event_created_at) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community.as_uuid())
+        .bind(event_id)
+        .bind(created_at)
+        .execute(tx.conn())
+        .await?;
+    } else if kind == KIND_MESSAGE_EDIT {
+        enqueue_events_in_transaction(tx, &[event_id.to_vec()], &[created_at]).await?;
+    }
+    Ok(())
+}
+
+/// [`enqueue_in_transaction`] for events named by key whose kinds the caller
+/// does not hold. Events of other kinds are skipped.
+pub(crate) async fn enqueue_events_in_transaction(
+    tx: &mut AdmittedTx,
+    event_ids: &[Vec<u8>],
+    created_at: &[DateTime<Utc>],
+) -> Result<()> {
+    if !ENABLED.load(Ordering::Relaxed) || event_ids.is_empty() {
         return Ok(());
     }
     let community = tx.community();
-    sqlx::query(
-        "INSERT INTO search_outbox (community_id, event_id, event_created_at) VALUES ($1, $2, $3)",
-    )
-    .bind(community.as_uuid())
-    .bind(event_id)
-    .bind(created_at)
-    .execute(tx.conn())
-    .await?;
+    // An edit queues the message it targets in its own channel.
+    let sql = format!(
+        "INSERT INTO search_outbox (community_id, event_id, event_created_at) \
+         SELECT $1, e.id, e.created_at \
+         FROM unnest($2::bytea[], $3::timestamptz[]) AS k(id, created_at) \
+         JOIN events e ON e.community_id = $1 AND e.created_at = k.created_at AND e.id = k.id \
+         WHERE e.kind = ANY($4) \
+         UNION ALL \
+         SELECT $1, original.id, original.created_at \
+         FROM unnest($2::bytea[], $3::timestamptz[]) AS k(id, created_at) \
+         JOIN events edit \
+           ON edit.community_id = $1 AND edit.created_at = k.created_at AND edit.id = k.id \
+         JOIN events original \
+           ON original.community_id = $1 AND original.channel_id = edit.channel_id \
+          AND original.id = {target} \
+         WHERE edit.kind = {KIND_MESSAGE_EDIT} AND original.kind = ANY($4)",
+        target = crate::store::media::edit_target("edit"),
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(community.as_uuid())
+        .bind(event_ids)
+        .bind(created_at)
+        .bind(SEARCHABLE_KINDS.as_slice())
+        .execute(tx.conn())
+        .await?;
     Ok(())
 }
 
@@ -214,7 +281,8 @@ pub async fn claim_batch(
     Ok(None)
 }
 
-/// Read the current state of each live, searchable queued event.
+/// Read the current state of each live, searchable queued event, with the
+/// text of its latest live edit in place of its own.
 async fn read_documents(
     tx: &mut AdmittedTx,
     queued: &std::collections::BTreeMap<[u8; 32], DateTime<Utc>>,
@@ -223,9 +291,12 @@ async fn read_documents(
     let ids: Vec<&[u8]> = queued.keys().map(|id| id.as_slice()).collect();
     let created: Vec<DateTime<Utc>> = queued.values().copied().collect();
     // The (created_at, id) pair is the events key, so each lookup prunes to
-    // one partition.
-    let rows = sqlx::query(
-        "SELECT e.id, e.kind, e.pubkey, e.channel_id, e.created_at, e.content, \
+    // one partition. The latest edit is the one clients show (see
+    // `media::latest_message_edit_sql`), read through the partial
+    // `idx_events_media_edit_target`, whose predicate needs the literal kind.
+    let sql = format!(
+        "SELECT e.id, e.kind, e.pubkey, e.channel_id, e.created_at, \
+                COALESCE(edit.content, e.content) AS content, \
                 c.channel_type::text AS channel_type, \
                 (u.agent_owner_pubkey IS NOT NULL) AS author_is_agent, \
                 t.root_event_id, \
@@ -235,19 +306,28 @@ async fn read_documents(
          FROM unnest($2::bytea[], $3::timestamptz[]) AS k(id, created_at) \
          JOIN events e \
            ON e.community_id = $1 AND e.created_at = k.created_at AND e.id = k.id \
+         LEFT JOIN LATERAL ( \
+             SELECT ed.content FROM events ed \
+             WHERE ed.community_id = e.community_id AND ed.channel_id = e.channel_id \
+               AND ed.kind = {KIND_MESSAGE_EDIT} AND ed.deleted_at IS NULL \
+               AND {target} = e.id \
+             ORDER BY ed.created_at DESC, ed.id DESC LIMIT 1 \
+         ) edit ON true \
          LEFT JOIN channels c ON c.community_id = e.community_id AND c.id = e.channel_id \
          LEFT JOIN users u ON u.community_id = e.community_id AND u.pubkey = e.pubkey \
          LEFT JOIN thread_metadata t \
            ON t.community_id = e.community_id \
           AND t.event_created_at = e.created_at AND t.event_id = e.id \
          WHERE e.deleted_at IS NULL AND e.kind = ANY($4)",
-    )
-    .bind(community.as_uuid())
-    .bind(&ids)
-    .bind(&created)
-    .bind(SEARCHABLE_KINDS.as_slice())
-    .fetch_all(tx.conn())
-    .await?;
+        target = crate::store::media::edit_target("ed"),
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(community.as_uuid())
+        .bind(&ids)
+        .bind(&created)
+        .bind(SEARCHABLE_KINDS.as_slice())
+        .fetch_all(tx.conn())
+        .await?;
     let mut documents = Vec::with_capacity(rows.len());
     for row in rows {
         documents.push(SearchDocument {

@@ -12,8 +12,7 @@ use search_suite::{search_suite_tests, Backend};
 
 // Not run here, with the reason:
 // - kind0_* and artifact_*: kinds 0 and 45010 are not searchable kinds;
-// - prefix_*: prefix mode is reworked with prefix analysis (issue 06);
-// - deleted_events_are_excluded: deletes reach the index in issue 04.
+// - prefix_*: prefix mode is reworked with prefix analysis (issue 06).
 search_suite_tests! {
     Backend::OpenSearch;
     #[ignore = "requires Postgres and OpenSearch"]
@@ -33,16 +32,21 @@ search_suite_tests! {
     fn excluded_kinds_are_storage_level_unsearchable,
     fn author_only_kinds_are_storage_level_unsearchable,
     fn p_gated_persistent_kinds_have_storage_null_tsvector,
+    fn deleted_events_are_excluded,
 }
 
 use std::time::Duration;
 
 use buzz_core::CommunityId;
-use buzz_db::{search_outbox, Db, DbConfig};
+use buzz_db::channel::{ChannelType, ChannelVisibility};
+use buzz_db::event::ThreadMetadataParams;
+use buzz_db::user_deletion::content_batches::ContentBatchOptions;
+use buzz_db::user_deletion::ExecutionMode;
+use buzz_db::{search_outbox, Db, DbConfig, DeletionTarget};
 use buzz_search::indexer::Indexer;
 use buzz_search::opensearch::{OpenSearchConfig, SearchIndex};
 use buzz_search::{ChannelScope, SearchMode, SearchQuery, SearchService, SearchSort};
-use nostr::{Event, EventBuilder, Keys, Kind};
+use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use opensearch::http::transport::Transport;
 use opensearch::indices::{IndicesCreateParts, IndicesExistsParts};
 use opensearch::{GetParts, OpenSearch};
@@ -342,5 +346,253 @@ async fn writes_never_create_an_index() {
     index.refresh().await.expect("refresh");
     let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
     assert_eq!(find(&service, community, "orphan").await.len(), 1);
+    index.delete().await.expect("delete index");
+}
+
+fn signed_at(event: &Event) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(event.created_at.as_secs() as i64, 0).expect("timestamp")
+}
+
+/// A channel of `community` created by `owner`.
+async fn channel(db: &Db, community: CommunityId, owner: &Keys) -> Uuid {
+    db.ensure_user(community, owner.public_key().as_bytes())
+        .await
+        .expect("ensure user");
+    db.create_channel(
+        community,
+        &format!("sync-{}", Uuid::new_v4().simple()),
+        ChannelType::Stream,
+        ChannelVisibility::Open,
+        None,
+        owner.public_key().as_bytes(),
+        None,
+    )
+    .await
+    .expect("create channel")
+    .id
+}
+
+/// A message in `channel`, signed `offset` seconds from now.
+fn channel_message(
+    keys: &Keys,
+    channel: Uuid,
+    kind: u16,
+    content: &str,
+    tags: &[&[&str]],
+    offset: i64,
+) -> Event {
+    let mut all = vec![Tag::parse(["h", &channel.to_string()]).expect("h tag")];
+    all.extend(
+        tags.iter()
+            .map(|tag| Tag::parse(tag.iter().copied()).expect("tag")),
+    );
+    EventBuilder::new(Kind::Custom(kind), content)
+        .tags(all)
+        .custom_created_at(Timestamp::from(
+            (Timestamp::now().as_secs() as i64 + offset) as u64,
+        ))
+        .sign_with_keys(keys)
+        .expect("sign")
+}
+
+/// Delete `target` with a NIP-09 deletion, as the relay stores one.
+async fn delete(db: &Db, community: CommunityId, keys: &Keys, channel: Uuid, target: &Event) {
+    let deletion = channel_message(keys, channel, 5, "", &[&["e", &target.id.to_hex()]], 2);
+    let (_, _, deleted, _) = db
+        .insert_deletion_event(
+            community,
+            &deletion,
+            Some(channel),
+            None,
+            &[DeletionTarget {
+                event_id: target.id.as_bytes(),
+                created_at: signed_at(target),
+                parent_event_id: None,
+                root_event_id: None,
+            }],
+            &Keys::generate(),
+        )
+        .await
+        .expect("insert deletion");
+    assert_eq!(deleted, vec![true]);
+}
+
+/// A deleted message no longer matches once the indexer catches up.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn a_deleted_message_no_longer_matches() {
+    let db = sync_db().await;
+    let (index, _) = sync_index().await;
+    let community = search_suite::mk_community(db.pool(), "delete.example").await;
+    let keys = Keys::generate();
+    let channel = channel(&db, community, &keys).await;
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    let indexer = tokio::spawn(Indexer::new(db.clone(), index.clone()).run());
+
+    let doomed = channel_message(&keys, channel, 9, "deleteword doomed", &[], 0);
+    let kept = channel_message(&keys, channel, 9, "deleteword kept", &[], 0);
+    for event in [&doomed, &kept] {
+        db.insert_event(community, event, Some(channel))
+            .await
+            .expect("insert");
+    }
+    wait_until_indexed(&db, &index).await;
+    assert_eq!(find(&service, community, "deleteword").await.len(), 2);
+
+    delete(&db, community, &keys, channel, &doomed).await;
+    wait_until_indexed(&db, &index).await;
+    assert_eq!(
+        find(&service, community, "deleteword").await,
+        vec![*kept.id.as_bytes()]
+    );
+
+    indexer.abort();
+    index.delete().await.expect("delete index");
+}
+
+/// An edited message matches its new text and not its old text; deleting
+/// the edit brings the old text back.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn an_edited_message_matches_its_current_text() {
+    let db = sync_db().await;
+    let (index, _) = sync_index().await;
+    let community = search_suite::mk_community(db.pool(), "edit.example").await;
+    let keys = Keys::generate();
+    let channel = channel(&db, community, &keys).await;
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    let indexer = tokio::spawn(Indexer::new(db.clone(), index.clone()).run());
+
+    let original = channel_message(&keys, channel, 9, "oldword typo", &[], 0);
+    db.insert_event(community, &original, Some(channel))
+        .await
+        .expect("insert");
+    wait_until_indexed(&db, &index).await;
+    assert_eq!(
+        find(&service, community, "oldword").await,
+        vec![*original.id.as_bytes()]
+    );
+
+    let target = original.id.to_hex();
+    let first = channel_message(&keys, channel, 40003, "midword", &[&["e", &target]], 1);
+    let latest = channel_message(
+        &keys,
+        channel,
+        40003,
+        "newword fixed",
+        &[&["e", &target]],
+        2,
+    );
+    for edit in [&latest, &first] {
+        db.insert_event(community, edit, Some(channel))
+            .await
+            .expect("insert edit");
+    }
+    wait_until_indexed(&db, &index).await;
+    assert!(find(&service, community, "oldword").await.is_empty());
+    assert!(find(&service, community, "midword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "newword").await,
+        vec![*original.id.as_bytes()]
+    );
+
+    delete(&db, community, &keys, channel, &latest).await;
+    delete(&db, community, &keys, channel, &first).await;
+    wait_until_indexed(&db, &index).await;
+    assert!(find(&service, community, "newword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "oldword").await,
+        vec![*original.id.as_bytes()]
+    );
+
+    indexer.abort();
+    index.delete().await.expect("delete index");
+}
+
+/// Account deletion scrubs a message another person replied to and erases
+/// the rest; neither matches its text afterwards, and the reply still does.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn scrubbed_and_erased_messages_no_longer_match() {
+    let db = sync_db().await;
+    let (index, _) = sync_index().await;
+    let community = search_suite::mk_community(db.pool(), "scrub.example").await;
+    let leaving = Keys::generate();
+    let staying = Keys::generate();
+    let channel = channel(&db, community, &leaving).await;
+    db.ensure_user(community, staying.public_key().as_bytes())
+        .await
+        .expect("ensure user");
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    let indexer = tokio::spawn(Indexer::new(db.clone(), index.clone()).run());
+
+    let root = channel_message(&leaving, channel, 9, "scrubword referenced", &[], -2);
+    let erased = channel_message(&leaving, channel, 9, "scrubword alone", &[], -1);
+    for event in [&root, &erased] {
+        db.insert_event(community, event, Some(channel))
+            .await
+            .expect("insert");
+    }
+    let root_hex = root.id.to_hex();
+    let reply = channel_message(
+        &staying,
+        channel,
+        9,
+        "replyword",
+        &[
+            &["e", &root_hex, "", "root"],
+            &["e", &root_hex, "", "reply"],
+        ],
+        0,
+    );
+    db.insert_event_with_thread_metadata(
+        community,
+        &reply,
+        Some(channel),
+        Some(ThreadMetadataParams {
+            event_id: reply.id.as_bytes(),
+            event_created_at: signed_at(&reply),
+            channel_id: channel,
+            parent_event_id: Some(root.id.as_bytes()),
+            parent_event_created_at: Some(signed_at(&root)),
+            root_event_id: Some(root.id.as_bytes()),
+            root_event_created_at: Some(signed_at(&root)),
+            depth: 1,
+            broadcast: false,
+        }),
+    )
+    .await
+    .expect("insert reply");
+    wait_until_indexed(&db, &index).await;
+    assert_eq!(find(&service, community, "scrubword").await.len(), 2);
+
+    let summary = db
+        .user_deletion_store()
+        .run_message_batches(
+            &ContentBatchOptions {
+                community: *community.as_uuid(),
+                pubkey: leaving.public_key().to_hex(),
+                relay_pubkey: None,
+                batch_size: 100,
+                max_items: 1000,
+            },
+            ExecutionMode::Delete,
+            None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("delete the account's messages");
+    assert_eq!(
+        summary.scrubbed_events, 1,
+        "the replied-to root is scrubbed"
+    );
+    wait_until_indexed(&db, &index).await;
+    assert!(find(&service, community, "scrubword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "replyword").await,
+        vec![*reply.id.as_bytes()]
+    );
+
+    indexer.abort();
     index.delete().await.expect("delete index");
 }
