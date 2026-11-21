@@ -12,14 +12,26 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   a row for each removed message the same way. A message edit (kind 40003),
   or a deletion of one, queues the message it edits.
 - One relay instance holds the indexer lease (a Postgres session advisory
-  lock). It claims a batch of one community's rows, re-reads those events,
-  writes or removes their documents in one bulk request, and deletes the rows
-  it claimed. A message is indexed with the text of its latest live edit; a
-  deleted or scrubbed message has its document removed. A failed request
-  leaves the rows queued; the indexer retries with backoff capped at 60
-  seconds. A batch the cluster rejects outright (HTTP 400
-  or 413) skips its community for that pass, so other communities keep
-  indexing.
+  lock). Instances that start together spread their lease attempts with
+  jitter, and followers check the lease every 2.5 to 5 seconds. The lease
+  holder runs `BUZZ_SEARCH_INDEXER_WORKERS` workers. Each claims a batch of
+  one community's rows (no two workers index the same community at once),
+  re-reads those events, writes or removes their documents in one bulk
+  request, and deletes the claimed rows whose items succeeded. So at most
+  that many bulk requests are in flight. A message is indexed with the text
+  of its latest live edit; a deleted or scrubbed message has its document
+  removed. A change committed while its message's earlier row is being
+  indexed keeps its own row and is indexed afterwards.
+- Failures delay indexing and never drop a row. A failed request or item
+  keeps its rows queued and skips its community for the rest of the pass;
+  a failed pass retries with jittered backoff capped at 60 seconds. Items
+  the cluster refuses for good (HTTP 400 or 413, for example a term too long
+  for the mapping) are logged, counted and retried with each later batch of
+  their community, but do not back the indexer off or stop the rest of the
+  community indexing. Only a batch of nothing but refused items skips its
+  community for the pass, so a community with a full batch of them is stuck
+  until they are fixed: watch `buzz_search_index_rejected_total`. Throttling (HTTP 429, which Serverless returns while
+  it scales) backs off the same way without counting as a failure.
 - The lease holder also backfills messages stored before the outbox was on.
   For each community it queues the keys of searchable messages in batches
   of 500, newest first, and records how far it got in `search_backfill`
@@ -49,6 +61,7 @@ run on Postgres full-text search; the index is built ahead of switching reads.
 | --- | --- |
 | `BUZZ_OPENSEARCH_URL` | HTTP(S) cluster URL without credentials, query or fragment. Unset disables the outbox and indexer. |
 | `BUZZ_OPENSEARCH_USERNAME`, `BUZZ_OPENSEARCH_PASSWORD` | Optional basic auth. Set both or neither. |
+| `BUZZ_SEARCH_INDEXER_WORKERS` | Indexer workers, and so bulk requests in flight, on the lease holder: 1 to 32, default 1. Backfill is fed from the lease holder alone whatever the count. |
 
 ## Rollout order
 
@@ -78,10 +91,12 @@ short-lived queue entries and progress markers, not data.
 | `buzz_search_backfill_cursor_timestamp_seconds` | `community` | Creation time of the oldest message queued so far; everything newer is queued. |
 | `buzz_search_backfill_complete` | `community` | 1 once the community's backfill is complete. |
 | `buzz_search_indexed_documents_total` | `community`, `op` (`write`, `remove`) | Documents the indexer wrote or removed. Its rate is the indexing rate. |
+| `buzz_search_index_rejected_total` | `community` | Bulk items the cluster refused for good. Their rows stay queued; a steady rate needs a look at the documents or mapping. |
+| `buzz_search_indexer_throttled_total` | | Passes the cluster throttled. |
 
 Each drain pass that indexed anything ends with an info log,
-`search indexer drained the outbox`, with `batches`, `written`, `removed`,
-`elapsed_ms` and `documents_per_second`. To measure throughput locally, store
+`search indexer drained the outbox`, with `workers`, `batches`, `written`,
+`removed`, `failed`, `elapsed_ms` and `documents_per_second`. To measure throughput locally, store
 messages with `BUZZ_OPENSEARCH_URL` unset, then start the relay with it set:
 the backfill passes log their rates as they catch up.
 

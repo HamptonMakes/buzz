@@ -39,6 +39,24 @@ pub const DEFAULT_INDEX_PREFIX: &str = "buzz-";
 /// (and its admitted transaction) or a search open.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The status OpenSearch throttles with, notably Serverless while it scales.
+const THROTTLED: u16 = 429;
+
+/// What a bulk write did, item by item.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BulkOutcome {
+    /// Events whose item failed: their outbox rows stay queued.
+    pub failed: Vec<[u8; 32]>,
+    /// How many of those OpenSearch refused for good (HTTP 400 or 413):
+    /// retrying them fails the same way until the document or mapping
+    /// changes.
+    pub rejected: usize,
+    /// Whether OpenSearch throttled the request or any item (HTTP 429).
+    pub throttled: bool,
+    /// The first failure's error type: a fixed description, never content.
+    pub reason: Option<String>,
+}
+
 /// OpenSearch's default `index.max_result_window`: `from + size` beyond it is
 /// rejected, so pages past it are empty.
 const MAX_RESULT_WINDOW: i64 = 10_000;
@@ -172,18 +190,21 @@ impl SearchIndex {
     }
 
     /// Upsert `documents` and delete `removed` for one community, in one
-    /// bulk request through the alias. Fails unless every item succeeded;
-    /// deleting a document that is not there succeeds. The request requires
+    /// bulk request through the alias, and report each item's result.
+    /// Deleting a document that is not there succeeds. The request requires
     /// the alias, so a missing index fails the write instead of being created
     /// with a dynamic mapping.
+    ///
+    /// A throttled request (HTTP 429) comes back as an outcome in which every
+    /// item failed; any other failed request is an error.
     pub async fn write(
         &self,
         community: CommunityId,
         documents: &[SearchDocument],
         removed: &[[u8; 32]],
-    ) -> Result<(), SearchError> {
+    ) -> Result<BulkOutcome, SearchError> {
         if documents.is_empty() && removed.is_empty() {
-            return Ok(());
+            return Ok(BulkOutcome::default());
         }
         let index = &self.alias;
         let mut operations: Vec<BulkOperation<Value>> =
@@ -203,6 +224,12 @@ impl SearchIndex {
                     .into(),
             );
         }
+        // Items come back in request order.
+        let events: Vec<[u8; 32]> = documents
+            .iter()
+            .map(|document| document.event_id)
+            .chain(removed.iter().copied())
+            .collect();
         let response = self
             .client
             .bulk(BulkParts::None)
@@ -211,33 +238,48 @@ impl SearchIndex {
             .send()
             .await
             .map_err(transport_error)?;
+        if response.status_code().as_u16() == THROTTLED {
+            return Ok(BulkOutcome {
+                failed: events,
+                rejected: 0,
+                throttled: true,
+                reason: Some(format!("HTTP {THROTTLED}")),
+            });
+        }
         let body = checked(response).await?;
         if body["errors"] != true {
-            return Ok(());
+            return Ok(BulkOutcome::default());
         }
-        let failed = body["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.as_object()?.values().next())
-            .filter(|result| result.get("error").is_some())
-            .collect::<Vec<_>>();
-        let reason = failed
-            .first()
-            .and_then(|result| result["error"]["type"].as_str())
-            .unwrap_or("unknown");
-        let description = format!("{} bulk items failed ({reason})", failed.len());
-        // Only a batch whose every failure is the documents' own fault is
-        // rejected; anything else may succeed on a retry.
-        let rejected = !failed.is_empty()
-            && failed
-                .iter()
-                .all(|result| result["status"].as_u64().is_some_and(rejects));
-        Err(if rejected {
-            SearchError::Rejected(description)
-        } else {
-            SearchError::Engine(description)
-        })
+        let items = body["items"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if items.len() != events.len() {
+            return Err(SearchError::Engine(
+                "bulk response items do not match the request".into(),
+            ));
+        }
+        let mut outcome = BulkOutcome::default();
+        for (event, item) in events.into_iter().zip(items) {
+            let Some(result) = item.as_object().and_then(|item| item.values().next()) else {
+                return Err(SearchError::Engine("malformed bulk response item".into()));
+            };
+            if result.get("error").is_none() {
+                continue;
+            }
+            let status = result["status"].as_u64().unwrap_or(0);
+            outcome.throttled |= status == u64::from(THROTTLED);
+            if rejects(status) {
+                outcome.rejected += 1;
+            }
+            if outcome.reason.is_none() {
+                outcome.reason = Some(
+                    result["error"]["type"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                );
+            }
+            outcome.failed.push(event);
+        }
+        Ok(outcome)
     }
 
     /// Run a message search against the alias.

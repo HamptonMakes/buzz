@@ -2,14 +2,20 @@
 //!
 //! One relay instance holds the indexer lease (a session advisory lock) at a
 //! time; when it stops, its lock connection closes and another instance takes
-//! over on its next attempt. Rows are claimed with `SKIP LOCKED`, so more
-//! workers can run without a redesign.
+//! over on its next attempt. Instances that start together spread their
+//! attempts with jitter. The lease holder runs a configurable number of
+//! workers ([`Indexer::with_workers`]); each claims batches of a community no
+//! other worker is indexing, so at most that many bulk requests are in
+//! flight.
 //!
 //! Each batch re-reads its events from Postgres, writes them (or removes the
 //! documents of events that are gone) in one bulk request, and only then
-//! deletes the rows it claimed. A failed request leaves the rows queued for
-//! the next attempt. A batch the cluster rejects outright skips its community
-//! for the rest of the pass, so one community cannot hold back the others.
+//! deletes the claimed rows whose items succeeded. A failed item, or a failed
+//! request, leaves its rows queued for the next attempt, and its community is
+//! skipped for the rest of the pass so others keep indexing. Items the
+//! cluster refuses for good (HTTP 400 or 413) are logged and counted but do
+//! not back the indexer off. Throttling (HTTP 429) ends the pass and backs
+//! off with jitter, without counting as a failure.
 //!
 //! A batch holds its community's admission open for up to one request
 //! timeout. Community deletion's quiesce step waits for that batch, and once
@@ -22,6 +28,8 @@
 //! many backfill rows, and Postgres reads one batch of history at a time. Only
 //! the lease holder backfills, so a fleet queues each event once.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use buzz_db::{search_backfill, search_outbox, Db, DbError};
@@ -55,6 +63,31 @@ pub enum IndexerError {
     /// The index write failed.
     #[error("index write: {}", .0.kind())]
     Index(#[from] SearchError),
+    /// OpenSearch throttled a write (HTTP 429). Not a failure: back off.
+    #[error("index write throttled")]
+    Throttled,
+}
+
+/// What a drain indexed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    /// Bulk requests whose rows were completed.
+    pub batches: u64,
+    /// Documents written.
+    pub written: u64,
+    /// Documents removed.
+    pub removed: u64,
+    /// Items that failed; their rows stay queued.
+    pub failed: u64,
+}
+
+impl DrainReport {
+    fn add(&mut self, other: DrainReport) {
+        self.batches += other.batches;
+        self.written += other.written;
+        self.removed += other.removed;
+        self.failed += other.failed;
+    }
 }
 
 /// Moves queued events from `search_outbox` into a [`SearchIndex`].
@@ -64,6 +97,7 @@ pub struct Indexer {
     index: SearchIndex,
     batch_size: i64,
     backfill_bound: i64,
+    workers: usize,
 }
 
 impl Indexer {
@@ -74,7 +108,16 @@ impl Indexer {
             index,
             batch_size: BATCH_SIZE,
             backfill_bound: BACKFILL_OUTBOX_BOUND,
+            workers: 1,
         }
+    }
+
+    /// Run `workers` (at least one) batches at once when draining. Each
+    /// works on a different community, so this also bounds the bulk requests
+    /// in flight.
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
     }
 
     /// Claim at most `rows` outbox rows per bulk request, and backfill as
@@ -123,45 +166,155 @@ impl Indexer {
         Ok(queued)
     }
 
-    /// Index batches until none is left to claim. A community whose batch
-    /// the cluster rejects is skipped for the rest of the pass and reported
-    /// once the others are done; any other failure ends the pass.
+    /// Index batches with the configured number of workers until none is
+    /// left to claim. A community whose batch had a failed item is skipped
+    /// for the rest of the pass by that worker, unless every failure was a
+    /// refused item and the rest of the batch succeeded. Throttling stops every worker
+    /// and returns [`IndexerError::Throttled`]; another failure ends its
+    /// worker's drain and is returned once the others are done. Items the
+    /// cluster refuses for good are logged and counted, not returned.
     ///
     /// Ends with an info log of the documents written and removed and the
     /// elapsed time, for measuring throughput.
-    pub async fn drain(&self) -> Result<(), IndexerError> {
-        let mut pass = DrainPass::start();
-        let result = self.drain_counting(&mut pass).await;
-        pass.report();
-        result
+    pub async fn drain(&self) -> Result<DrainReport, IndexerError> {
+        let started = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut report = DrainReport::default();
+        let mut result = Ok(());
+        let mut keep = |worker_report: DrainReport, outcome: Result<(), IndexerError>| {
+            report.add(worker_report);
+            // Keep the first failure; it outranks throttling.
+            if let Err(error) = outcome {
+                if !matches!(
+                    result,
+                    Err(IndexerError::Outbox(_) | IndexerError::Index(_))
+                ) {
+                    result = Err(error);
+                }
+            }
+        };
+        if self.workers == 1 {
+            let mut worker_report = DrainReport::default();
+            let outcome = self.drain_worker(&mut worker_report, &stop).await;
+            keep(worker_report, outcome);
+        } else {
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..self.workers {
+                let (indexer, stop) = (self.clone(), Arc::clone(&stop));
+                workers.spawn(async move {
+                    let mut worker_report = DrainReport::default();
+                    let outcome = indexer.drain_worker(&mut worker_report, &stop).await;
+                    (worker_report, outcome)
+                });
+            }
+            while let Some(joined) = workers.join_next().await {
+                match joined {
+                    Ok((worker_report, outcome)) => keep(worker_report, outcome),
+                    Err(error) => keep(
+                        DrainReport::default(),
+                        Err(SearchError::Engine(format!("indexer worker ended: {error}")).into()),
+                    ),
+                }
+            }
+        }
+        if report.batches > 0 {
+            let elapsed = started.elapsed();
+            let indexed = report.written + report.removed;
+            info!(
+                workers = self.workers,
+                batches = report.batches,
+                written = report.written,
+                removed = report.removed,
+                failed = report.failed,
+                elapsed_ms = elapsed.as_millis() as u64,
+                documents_per_second =
+                    (indexed as f64 / elapsed.as_secs_f64().max(1e-3)).round() as u64,
+                "search indexer drained the outbox"
+            );
+        }
+        result.map(|()| report)
     }
 
-    async fn drain_counting(&self, pass: &mut DrainPass) -> Result<(), IndexerError> {
+    /// One worker's share of a drain.
+    async fn drain_worker(
+        &self,
+        report: &mut DrainReport,
+        stop: &AtomicBool,
+    ) -> Result<(), IndexerError> {
         let mut skipped: Vec<CommunityId> = Vec::new();
-        let mut rejection = None;
-        while let Some(batch) =
-            search_outbox::claim_batch(self.db.pool(), self.batch_size, &skipped).await?
-        {
+        let mut failure = None;
+        while !stop.load(Ordering::Relaxed) {
+            let Some(batch) =
+                search_outbox::claim_batch(self.db.pool(), self.batch_size, &skipped).await?
+            else {
+                break;
+            };
             let community = batch.community();
-            match self
+            let outcome = match self
                 .index
                 .write(community, &batch.documents, &batch.removed)
                 .await
             {
-                Ok(()) => {
-                    let (written, removed) = (batch.documents.len(), batch.removed.len());
-                    batch.complete().await?;
-                    pass.record(community, written, removed);
-                }
+                Ok(outcome) => outcome,
                 Err(error @ SearchError::Rejected(_)) => {
+                    // The whole request was refused; its rows stay queued.
                     warn!(%community, error = %error.kind(), "search index rejected a batch; its rows stay queued");
+                    metrics::counter!("buzz_search_index_rejected_total", "community" => community.to_string())
+                        .increment((batch.documents.len() + batch.removed.len()) as u64);
                     skipped.push(community);
-                    rejection.get_or_insert(error);
+                    continue;
                 }
                 Err(error) => return Err(error.into()),
+            };
+            let items = (batch.documents.len() + batch.removed.len()) as u64;
+            let written = batch
+                .documents
+                .iter()
+                .filter(|document| !outcome.failed.contains(&document.event_id))
+                .count() as u64;
+            let removed = batch
+                .removed
+                .iter()
+                .filter(|event| !outcome.failed.contains(event))
+                .count() as u64;
+            batch.complete_except(&outcome.failed).await?;
+            let label = community.to_string();
+            metrics::counter!("buzz_search_indexed_documents_total", "community" => label.clone(), "op" => "write")
+                .increment(written);
+            metrics::counter!("buzz_search_indexed_documents_total", "community" => label.clone(), "op" => "remove")
+                .increment(removed);
+            report.batches += 1;
+            report.written += written;
+            report.removed += removed;
+            if outcome.failed.is_empty() {
+                continue;
+            }
+            report.failed += outcome.failed.len() as u64;
+            let reason = outcome.reason.as_deref().unwrap_or("unknown");
+            if outcome.throttled {
+                stop.store(true, Ordering::Relaxed);
+                return Err(IndexerError::Throttled);
+            }
+            if outcome.rejected > 0 {
+                metrics::counter!("buzz_search_index_rejected_total", "community" => label)
+                    .increment(outcome.rejected as u64);
+            }
+            if outcome.rejected == outcome.failed.len() {
+                warn!(%community, items = outcome.rejected, reason, "search index rejected documents; their rows stay queued");
+                // Refused items are claimed again with the next batch; keep
+                // going while the rest of each batch succeeds.
+                if written + removed == 0 && items > 0 {
+                    skipped.push(community);
+                }
+            } else {
+                skipped.push(community);
+                failure.get_or_insert(SearchError::Engine(format!(
+                    "{} bulk items failed ({reason})",
+                    outcome.failed.len()
+                )));
             }
         }
-        rejection.map_or(Ok(()), |error| Err(error.into()))
+        failure.map_or(Ok(()), |error| Err(error.into()))
     }
 
     /// One leader pass: make sure the index exists, top the outbox up with
@@ -181,11 +334,16 @@ impl Indexer {
     /// Hold the indexer lease and keep the index up to date, forever. Abort
     /// the task to stop; that closes the lease connection and lets another
     /// instance take over.
+    ///
+    /// Every wait is jittered, so instances restarted together spread their
+    /// lease attempts instead of polling Postgres in step. Failed lease
+    /// attempts and failed passes back off up to [`MAX_BACKOFF`]; so does
+    /// throttling, which is counted and logged apart from failures.
     pub async fn run(self) {
-        // Spread lease attempts of instances that start together.
         tokio::time::sleep(POLL_INTERVAL.mul_f64(rand::random::<f64>())).await;
         let mut leader: Option<buzz_db::SessionLeader> = None;
         let mut failures = 0u32;
+        let mut throttled = 0u32;
         loop {
             if let Some(guard) = leader.as_mut() {
                 if !guard.is_live().await {
@@ -198,9 +356,13 @@ impl Indexer {
                     Ok(Some(acquired)) => {
                         info!("acquired the search indexer lease");
                         leader = Some(acquired);
+                        failures = 0;
                     }
-                    Ok(None) => {}
-                    Err(error) => warn!(%error, "search indexer lease attempt failed"),
+                    Ok(None) => failures = 0,
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        warn!(%error, failures, "search indexer lease attempt failed");
+                    }
                 }
             }
             let mut backfilling = false;
@@ -208,7 +370,13 @@ impl Indexer {
                 match self.pass().await {
                     Ok(more) => {
                         failures = 0;
+                        throttled = 0;
                         backfilling = more;
+                    }
+                    Err(IndexerError::Throttled) => {
+                        throttled = throttled.saturating_add(1);
+                        metrics::counter!("buzz_search_indexer_throttled_total").increment(1);
+                        info!(throttled, "search index throttled the indexer; backing off");
                     }
                     Err(error) => {
                         failures = failures.saturating_add(1);
@@ -221,65 +389,15 @@ impl Indexer {
                 tokio::task::yield_now().await;
                 continue;
             }
-            tokio::time::sleep(backoff(failures)).await;
+            tokio::time::sleep(backoff(failures.max(throttled))).await;
         }
-    }
-}
-
-/// Documents one drain pass wrote and removed, for metrics and the
-/// throughput log.
-struct DrainPass {
-    started: Instant,
-    batches: u64,
-    written: u64,
-    removed: u64,
-}
-
-impl DrainPass {
-    fn start() -> Self {
-        Self {
-            started: Instant::now(),
-            batches: 0,
-            written: 0,
-            removed: 0,
-        }
-    }
-
-    fn record(&mut self, community: CommunityId, written: usize, removed: usize) {
-        let (written, removed) = (written as u64, removed as u64);
-        let label = community.to_string();
-        metrics::counter!("buzz_search_indexed_documents_total", "community" => label.clone(), "op" => "write")
-            .increment(written);
-        metrics::counter!("buzz_search_indexed_documents_total", "community" => label, "op" => "remove")
-            .increment(removed);
-        self.batches += 1;
-        self.written += written;
-        self.removed += removed;
-    }
-
-    fn report(&self) {
-        if self.batches == 0 {
-            return;
-        }
-        let elapsed = self.started.elapsed();
-        let per_second = (self.written + self.removed) as f64 / elapsed.as_secs_f64().max(1e-3);
-        info!(
-            batches = self.batches,
-            written = self.written,
-            removed = self.removed,
-            elapsed_ms = elapsed.as_millis() as u64,
-            documents_per_second = per_second.round() as u64,
-            "search indexer drained the outbox"
-        );
     }
 }
 
 /// The wait before the next attempt: the poll interval, doubled per
-/// consecutive failure up to [`MAX_BACKOFF`], with jitter after a failure.
+/// consecutive failure up to [`MAX_BACKOFF`], scaled by a random factor
+/// between one half and one.
 fn backoff(failures: u32) -> Duration {
-    if failures == 0 {
-        return POLL_INTERVAL;
-    }
     let ceiling = POLL_INTERVAL
         .saturating_mul(1 << failures.min(4))
         .min(MAX_BACKOFF);
@@ -291,8 +409,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_grows_to_a_cap() {
-        assert_eq!(backoff(0), POLL_INTERVAL);
+    fn backoff_grows_to_a_cap_with_jitter() {
+        let idle: Vec<Duration> = (0..64).map(|_| backoff(0)).collect();
+        assert!(idle
+            .iter()
+            .all(|wait| *wait >= POLL_INTERVAL / 2 && *wait <= POLL_INTERVAL));
+        assert!(
+            idle.iter().any(|wait| *wait != idle[0]),
+            "idle waits are jittered: {idle:?}"
+        );
         for failures in 1..10 {
             let wait = backoff(failures);
             assert!(wait <= MAX_BACKOFF, "{failures}: {wait:?}");

@@ -43,7 +43,7 @@ use buzz_db::event::ThreadMetadataParams;
 use buzz_db::user_deletion::content_batches::ContentBatchOptions;
 use buzz_db::user_deletion::ExecutionMode;
 use buzz_db::{search_outbox, Db, DbConfig, DeletionTarget};
-use buzz_search::indexer::Indexer;
+use buzz_search::indexer::{Indexer, IndexerError};
 use buzz_search::opensearch::{OpenSearchConfig, SearchIndex};
 use buzz_search::{ChannelScope, SearchMode, SearchQuery, SearchService, SearchSort};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -280,11 +280,13 @@ fn raw_client() -> OpenSearch {
     OpenSearch::new(Transport::single_node(&opensearch_url()).expect("transport"))
 }
 
-/// A batch the cluster rejects leaves its rows queued and its community
-/// skipped, while other communities are still indexed in the same pass.
+/// A bulk item the cluster rejects keeps only its own row queued: the other
+/// items of the same request are indexed and their rows removed, other
+/// communities are indexed in the same pass, and the pass does not fail, so
+/// nothing backs off.
 #[tokio::test]
 #[ignore = "requires Postgres and OpenSearch"]
-async fn a_rejected_community_does_not_hold_back_others() {
+async fn a_failed_bulk_item_keeps_only_its_own_row() {
     let db = sync_db().await;
     // An index whose `content` is a keyword: a term longer than 32766 bytes
     // is rejected per document with HTTP 400.
@@ -303,30 +305,46 @@ async fn a_rejected_community_does_not_hold_back_others() {
     let index = SearchIndex::new(&OpenSearchConfig {
         url: opensearch_url(),
         basic_auth: None,
-        index_prefix: prefix,
+        index_prefix: prefix.clone(),
     })
     .expect("client");
 
     let poisoned = search_suite::mk_community(db.pool(), "poisoned.example").await;
     let healthy = search_suite::mk_community(db.pool(), "healthy.example").await;
     let keys = Keys::generate();
-    db.insert_event(poisoned, &message(&keys, &"x".repeat(40_000)), None)
-        .await
-        .expect("insert oversized term");
-    db.insert_event(healthy, &message(&keys, "fine"), None)
-        .await
-        .expect("insert");
+    let oversized = message(&keys, &"x".repeat(40_000));
+    let neighbour = message(&keys, "fine neighbour");
+    let elsewhere = message(&keys, "fine elsewhere");
+    for (community, event) in [
+        (poisoned, &oversized),
+        (poisoned, &neighbour),
+        (healthy, &elsewhere),
+    ] {
+        db.insert_event(community, event, None)
+            .await
+            .expect("insert");
+    }
 
-    let error = Indexer::new(db.clone(), index.clone())
+    let report = Indexer::new(db.clone(), index.clone())
         .drain()
         .await
-        .expect_err("the pass reports the rejected batch");
-    assert!(error.to_string().contains("rejected"), "{error}");
-    let queued: Vec<Uuid> = sqlx::query_scalar("SELECT community_id FROM search_outbox")
-        .fetch_all(db.pool())
-        .await
-        .expect("queued rows");
-    assert_eq!(queued, vec![*poisoned.as_uuid()]);
+        .expect("a rejected item does not fail the pass");
+    // The refused item is tried again with its community's next batch,
+    // which holds nothing else, so that community is skipped.
+    assert_eq!((report.written, report.failed), (2, 2));
+    assert_eq!(queued_events(&db).await, vec![*oversized.id.as_bytes()]);
+    for (community, event, found) in [
+        (poisoned, &oversized, false),
+        (poisoned, &neighbour, true),
+        (healthy, &elsewhere, true),
+    ] {
+        assert_eq!(
+            indexed(&prefix, community, event).await,
+            found,
+            "{}",
+            event.content
+        );
+    }
     index.delete().await.expect("delete index");
 }
 
@@ -801,5 +819,359 @@ async fn the_indexer_backfills_on_its_own() {
     .await
     .expect("every stored message becomes searchable");
     indexer.abort();
+    index.delete().await.expect("delete index");
+}
+
+/// Whether the index holds `event`'s document.
+async fn indexed(prefix: &str, community: CommunityId, event: &Event) -> bool {
+    let response = raw_client()
+        .get(GetParts::IndexId(
+            &format!("{prefix}messages"),
+            &format!("{}:{}", community.as_uuid(), event.id.to_hex()),
+        ))
+        .send()
+        .await
+        .expect("get document");
+    let document: serde_json::Value = response.json().await.expect("document body");
+    document["found"] == true
+}
+
+/// What the proxy does with the next bulk request.
+enum Bulk {
+    /// Forward it.
+    Pass,
+    /// Answer HTTP 429, as Serverless does while it scales.
+    Throttle,
+    /// Signal `arrived`, wait for `release`, then forward it.
+    Hold {
+        arrived: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
+/// An HTTP proxy in front of the test cluster that can throttle or hold
+/// bulk requests.
+struct Proxy {
+    url: String,
+    bulk: std::sync::Arc<tokio::sync::Mutex<Bulk>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Proxy {
+    async fn start() -> Self {
+        let bulk = std::sync::Arc::new(tokio::sync::Mutex::new(Bulk::Pass));
+        let state = (bulk.clone(), reqwest::Client::new(), opensearch_url());
+        let app = axum::Router::new()
+            .fallback(proxy_request)
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let url = format!("http://{}", listener.local_addr().expect("proxy address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve proxy");
+        });
+        Self { url, bulk, server }
+    }
+
+    /// The index behind this proxy, using `prefix`.
+    fn index(&self, prefix: &str) -> SearchIndex {
+        SearchIndex::new(&OpenSearchConfig {
+            url: self.url.clone(),
+            basic_auth: None,
+            index_prefix: prefix.into(),
+        })
+        .expect("proxied client")
+    }
+
+    async fn set(&self, bulk: Bulk) {
+        *self.bulk.lock().await = bulk;
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+type ProxyState = (
+    std::sync::Arc<tokio::sync::Mutex<Bulk>>,
+    reqwest::Client,
+    String,
+);
+
+async fn proxy_request(
+    axum::extract::State((bulk, client, upstream)): axum::extract::State<ProxyState>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .expect("request body");
+    if parts.uri.path().ends_with("/_bulk") {
+        let action = std::mem::replace(&mut *bulk.lock().await, Bulk::Pass);
+        match action {
+            Bulk::Pass => {}
+            Bulk::Throttle => {
+                *bulk.lock().await = Bulk::Throttle;
+                return axum::response::Response::builder()
+                    .status(429)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"error":{"type":"too_many_requests"},"status":429}"#,
+                    ))
+                    .expect("throttled response");
+            }
+            Bulk::Hold { arrived, release } => {
+                let _ = arrived.send(());
+                let _ = release.await;
+            }
+        }
+    }
+    let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
+    let mut forward = client
+        .request(parts.method, format!("{upstream}{path}"))
+        .body(body);
+    if let Some(content_type) = parts.headers.get("content-type") {
+        forward = forward.header("content-type", content_type);
+    }
+    let response = forward.send().await.expect("forward to OpenSearch");
+    let mut builder = axum::response::Response::builder().status(response.status().as_u16());
+    if let Some(content_type) = response.headers().get("content-type") {
+        builder = builder.header("content-type", content_type);
+    }
+    builder
+        .body(axum::body::Body::from(
+            response.bytes().await.expect("OpenSearch response"),
+        ))
+        .expect("proxied response")
+}
+
+/// Throttling ends the pass as throttled, not failed, and keeps every row
+/// queued; indexing completes once the cluster accepts writes again.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn throttling_keeps_rows_queued() {
+    let db = sync_db().await;
+    let (index, prefix) = sync_index().await;
+    let proxy = Proxy::start().await;
+    let community = search_suite::mk_community(db.pool(), "throttle.example").await;
+    let keys = Keys::generate();
+    let queued = [
+        message(&keys, "slowword one"),
+        message(&keys, "slowword two"),
+    ];
+    for event in &queued {
+        db.insert_event(community, event, None)
+            .await
+            .expect("insert");
+    }
+    let indexer = Indexer::new(db.clone(), proxy.index(&prefix)).with_workers(2);
+
+    proxy.set(Bulk::Throttle).await;
+    let error = indexer.drain().await.expect_err("throttled");
+    assert!(matches!(error, IndexerError::Throttled), "{error}");
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 2);
+
+    proxy.set(Bulk::Pass).await;
+    let report = indexer.drain().await.expect("drain");
+    assert_eq!(report.written, 2);
+    index.refresh().await.expect("refresh");
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    assert_eq!(find(&service, community, "slowword").await.len(), 2);
+    index.delete().await.expect("delete index");
+}
+
+/// A change committed while an earlier row for the same message is being
+/// indexed keeps its own row and is indexed afterwards. The proxy holds the
+/// worker's bulk request, after its re-read and before its delete.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn a_change_during_indexing_is_indexed_afterwards() {
+    let db = sync_db().await;
+    let (index, prefix) = sync_index().await;
+    let proxy = Proxy::start().await;
+    let community = search_suite::mk_community(db.pool(), "gate.example").await;
+    let keys = Keys::generate();
+    let channel = channel(&db, community, &keys).await;
+    let original = channel_message(&keys, channel, 9, "firstword", &[], 0);
+    db.insert_event(community, &original, Some(channel))
+        .await
+        .expect("insert");
+
+    let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    proxy
+        .set(Bulk::Hold {
+            arrived: arrived_tx,
+            release: release_rx,
+        })
+        .await;
+    let indexer = Indexer::new(db.clone(), proxy.index(&prefix));
+    let drain = tokio::spawn(async move { indexer.drain().await });
+    arrived.await.expect("the worker sent its batch");
+
+    // The worker has read "firstword" and not yet deleted its row.
+    let edit = channel_message(
+        &keys,
+        channel,
+        40003,
+        "secondword",
+        &[&["e", &original.id.to_hex()]],
+        1,
+    );
+    db.insert_event(community, &edit, Some(channel))
+        .await
+        .expect("insert edit");
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 2);
+    release.send(()).expect("release the batch");
+
+    let report = drain.await.expect("drain task").expect("drain");
+    assert_eq!(report.batches, 2, "the edit's row is its own batch");
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+    index.refresh().await.expect("refresh");
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    assert!(find(&service, community, "firstword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "secondword").await,
+        vec![*original.id.as_bytes()]
+    );
+    index.delete().await.expect("delete index");
+}
+
+/// Two workers drain the outbox together without losing a row or indexing
+/// one twice, and afterwards the index holds exactly what Postgres does.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn two_workers_drain_without_loss() {
+    let db = sync_db().await;
+    let (index, prefix) = sync_index().await;
+    let keys = Keys::generate();
+    let mut stored = Vec::new();
+    for n in 0..3 {
+        let community = search_suite::mk_community(db.pool(), &format!("workers{n}.example")).await;
+        let channel = channel(&db, community, &keys).await;
+        for m in 0..30 {
+            let event = channel_message(&keys, channel, 9, &format!("workword {n} {m}"), &[], -m);
+            db.insert_event(community, &event, Some(channel))
+                .await
+                .expect("insert");
+            stored.push((community, channel, event));
+        }
+    }
+    let indexer = Indexer::new(db.clone(), index.clone())
+        .with_batch_size(7)
+        .with_workers(2);
+    let report = indexer.drain().await.expect("drain");
+    assert_eq!(
+        (report.written, report.removed, report.failed),
+        (90, 0, 0),
+        "every row indexed exactly once"
+    );
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+
+    // Delete every third message and edit every fifth live one.
+    let mut deleted = Vec::new();
+    for (i, (community, channel, event)) in stored.iter().enumerate() {
+        if i % 3 == 0 {
+            delete(&db, *community, &keys, *channel, event).await;
+            deleted.push(event.id);
+        } else if i % 5 == 0 {
+            let edit = channel_message(
+                &keys,
+                *channel,
+                40003,
+                "rewritten",
+                &[&["e", &event.id.to_hex()]],
+                1,
+            );
+            db.insert_event(*community, &edit, Some(*channel))
+                .await
+                .expect("insert edit");
+        }
+    }
+    indexer.drain().await.expect("drain");
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+    index.refresh().await.expect("refresh");
+    for (community, _, event) in &stored {
+        assert_eq!(
+            indexed(&prefix, *community, event).await,
+            !deleted.contains(&event.id),
+            "{}",
+            event.content
+        );
+    }
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    let mut rewritten = 0;
+    for community in stored
+        .iter()
+        .map(|(community, _, _)| *community)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        rewritten += find(&service, community, "rewritten").await.len();
+    }
+    let expected = (0..stored.len())
+        .filter(|i| i % 3 != 0 && i % 5 == 0)
+        .count();
+    assert_eq!(rewritten, expected);
+    let count: serde_json::Value = raw_client()
+        .count(opensearch::CountParts::Index(&[&format!(
+            "{prefix}messages"
+        )]))
+        .send()
+        .await
+        .expect("count")
+        .json()
+        .await
+        .expect("count body");
+    assert_eq!(count["count"], 60, "{count}");
+    index.delete().await.expect("delete index");
+}
+
+/// Several instances started at once end with exactly one lease holder, which
+/// indexes what is queued.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn instances_started_together_elect_one_leader() {
+    let db = sync_db().await;
+    let (index, _) = sync_index().await;
+    let community = search_suite::mk_community(db.pool(), "fleet.example").await;
+    let event = message(&Keys::generate(), "fleetword");
+    db.insert_event(community, &event, None)
+        .await
+        .expect("insert");
+    let instances: Vec<_> = (0..4)
+        .map(|_| tokio::spawn(Indexer::new(db.clone(), index.clone()).run()))
+        .collect();
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            index.refresh().await.expect("refresh");
+            if !find(&service, community, "fleetword").await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the leader indexes the queued message");
+    // The indexer lease: a session advisory lock on one bigint key, which
+    // pg_locks shows as its high and low halves.
+    let holders: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks \
+         WHERE locktype = 'advisory' AND granted AND objsubid = 1 \
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+           AND classid = $1::bigint::oid AND objid = $2::bigint::oid",
+    )
+    .bind(0x4255_5A5A_i64)
+    .bind(0x5345_4152_i64)
+    .fetch_one(db.pool())
+    .await
+    .expect("lease holders");
+    assert_eq!(holders, 1);
+    for instance in instances {
+        instance.abort();
+    }
     index.delete().await.expect("delete index");
 }
