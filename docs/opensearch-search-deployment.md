@@ -37,7 +37,10 @@ shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-se
   community indexing. Only a batch of nothing but refused items skips its
   community for the pass, so a community with a full batch of them is stuck
   until they are fixed: watch `buzz_search_index_rejected_total`. Throttling (HTTP 429, which Serverless returns while
-  it scales) backs off the same way without counting as a failure.
+  it scales) backs off the same way without counting as a failure. After
+  an outage the queue drains only once the indexer's current back-off ends,
+  so `buzz_search_index_lag_seconds` stays up for up to a minute after the
+  cluster is healthy again.
 - The lease holder also backfills messages stored before the outbox was on.
   For each community it queues the keys of searchable messages in batches
   of 500, newest first, and records how far it got in `search_backfill`
@@ -56,6 +59,10 @@ shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-se
   and never create an index, so a deleted index is recreated with its mapping
   on the next attempt. Documents hold the message
   text in an indexed field only; `_source` does not store it.
+- A new message becomes searchable on OpenSearch only after the index
+  refreshes, on top of the time to index it: every 30 seconds on a
+  self-hosted cluster (`refresh_interval`), on its own schedule on
+  Serverless. Postgres finds it as soon as it is stored.
 - The index name carries its mapping version (`buzz-messages-v2`) and the
   alias `buzz-messages` points at it. A relay never writes into an index of
   another version: if the alias points elsewhere, every pass fails with
@@ -132,6 +139,13 @@ hit is still re-read from Postgres and access-checked at every value.
 Word and prefix-mode searches (the bridge's `search_mode: "prefix"`) follow
 the flag alike.
 
+The backends differ on edited messages. Postgres matches the text a message
+was stored with and ignores its edits, while the index holds the text of the
+latest edit. So in shadow mode overlap drops for searches that touch edited
+messages, and moving to `2` changes their results: the edited text matches
+and the replaced text no longer does. Misspelled queries diverge the same
+way: OpenSearch matches words one or two typos away, and Postgres does not.
+
 The flag comes from the relay's feature-flag provider
 (`BUZZ_FEATURE_FLAGS_PROVIDER`). LaunchDarkly can target one community (the
 `community` context) and changes apply within seconds, without a restart. The
@@ -162,8 +176,13 @@ never contains the search text.
 ```sh
 docker compose --profile search up -d opensearch
 BUZZ_OPENSEARCH_URL=http://localhost:9200 just relay
-curl -s 'localhost:9200/buzz-messages/_search?pretty'
+curl -s 'localhost:9200/buzz-messages/_search?pretty' \
+  -H 'content-type: application/json' \
+  -d '{"query": {"term": {"community": "<community uuid>"}}}'
 ```
+
+Filter on the community as above: a local cluster is often shared by other
+relays and communities, whose documents sit in the same index.
 
 Watch the queue drain with
 `psql -c 'SELECT count(*) FROM search_outbox'` and the backfill progress with
