@@ -1,7 +1,8 @@
 # OpenSearch message index deployment
 
-The relay can keep an OpenSearch index of messages up to date. Searches still
-run on Postgres full-text search; the index is built ahead of switching reads.
+The relay can keep an OpenSearch index of messages up to date. Searches run on
+Postgres full-text search unless the `search.backend` flag moves a community to
+shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-search-backend)).
 
 ## How it works
 
@@ -105,6 +106,48 @@ Each drain pass that indexed anything ends with an info log,
 `removed`, `failed`, `elapsed_ms` and `documents_per_second`. To measure throughput locally, store
 messages with `BUZZ_OPENSEARCH_URL` unset, then start the relay with it set:
 the backfill passes log their rates as they catch up.
+
+## Choosing the search backend
+
+With `BUZZ_OPENSEARCH_URL` set, the integer flag `search.backend` chooses the
+backend for each community, read on every search:
+
+| Value | Results from | OpenSearch |
+| --- | --- | --- |
+| `0` (default, and any unknown value, counted in `buzz_search_backend_flag_invalid_total`) | Postgres | not queried |
+| `1` (shadow) | Postgres | runs the same first-page query alongside, with a 2 s deadline and at most 32 in flight; only compared and measured |
+| `2` | OpenSearch | a failed or partly failed search fails the request (CLOSED `error: search failed`); nothing falls back to Postgres |
+
+Without `BUZZ_OPENSEARCH_URL` the flag is ignored and Postgres serves. Every
+hit is still re-read from Postgres and access-checked at every value.
+Prefix-mode searches (the bridge's `search_mode: "prefix"`) stay on Postgres
+at every value until OpenSearch supports prefix analysis; they are counted in
+`buzz_search_opensearch_skipped_total{reason="unsupported_mode"}`.
+
+The flag comes from the relay's feature-flag provider
+(`BUZZ_FEATURE_FLAGS_PROVIDER`). LaunchDarkly can target one community (the
+`community` context) and changes apply within seconds, without a restart. The
+`environment` provider sets one value for every community on the instance and
+is read once at startup:
+
+```sh
+BUZZ_FEATURE_FLAGS_PROVIDER=environment BUZZ_FEATURE_FLAG_SEARCH_BACKEND=1 just relay
+```
+
+### Metrics
+
+| Metric | Meaning |
+| --- | --- |
+| `buzz_search_duration_seconds{backend, role}` | Search latency per backend; `role` is `primary` (served the request) or `shadow`. |
+| `buzz_search_requests_total{backend, role, outcome}` | `outcome`: `hits`, `zero_results` (first page empty), `empty_page` (later page empty), `error` (including failed shards and engine timeouts), `timeout` (shadow deadline). Zero-result rate is `zero_results` over first-page searches. |
+| `buzz_search_shadow_overlap_ratio` | Share of the top 10 hits both backends returned, over the larger list. |
+| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `unsupported_mode`, or `shadow_busy` when 32 shadow searches were already in flight. |
+| `buzz_search_outbox_depth` | Queued outbox rows (counted up to 1,000,000), sampled every 15 s. |
+| `buzz_search_index_lag_seconds` | Age of the oldest queued outbox row; `0` when the queue is empty. |
+
+Each shadow search also logs one `search shadow comparison` line with the
+community, page, both hit counts, overlap, OpenSearch latency and outcome. It
+never contains the search text.
 
 ## Local run
 
