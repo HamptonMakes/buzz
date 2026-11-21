@@ -21,11 +21,14 @@
 //! queued here: the purge deletes the community's rows, this queue included.
 //!
 //! The indexer drains the queue one community at a time with
-//! [`claim_batch`]: it locks rows other workers don't hold, re-reads the
-//! events they name (with an edited message's current text), writes the
-//! index, and calls [`SearchOutboxBatch::complete`] to delete exactly the
-//! rows it claimed. Because the indexer re-reads `events`, the order and
-//! number of rows for one event don't matter.
+//! [`claim_batch`]: it locks rows, re-reads the events they name (with an
+//! edited message's current text), writes the index, and calls
+//! [`SearchOutboxBatch::complete_except`] to delete exactly the rows it
+//! claimed whose index writes succeeded. Because the indexer re-reads
+//! `events`, the order and number of rows for one event don't matter, and a
+//! change committed while its message's earlier row is being indexed keeps
+//! its own row for the next batch. Only one batch per community runs at a
+//! time, so workers never race to write two states of one message.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,9 +50,14 @@ pub const SEARCHABLE_KINDS: [i32; 5] = [9, 40002, 40008, 45001, 45003];
 const KIND_MESSAGE_EDIT: i32 = buzz_core::kind::KIND_STREAM_MESSAGE_EDIT as i32;
 
 /// Communities a claim may pass over because their deletion fenced them
-/// between candidate selection and admission, or another worker holds all
-/// their rows.
+/// between candidate selection and admission, or another worker is
+/// indexing a batch of theirs.
 const CLAIM_COMMUNITY_CANDIDATES: usize = 8;
+
+/// First key of the transaction advisory lock a batch holds on its
+/// community; the second is a hash of the community id. Two-key advisory
+/// locks never collide with single-key ones such as the indexer lease.
+const CLAIM_LOCK_CLASS: i32 = 0x5345_4152;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -177,7 +185,8 @@ pub struct SearchDocument {
 #[must_use = "dropping a batch leaves its rows queued; call complete()"]
 pub struct SearchOutboxBatch {
     tx: AdmittedTx,
-    row_ids: Vec<Uuid>,
+    /// Claimed rows and the events they name.
+    rows: Vec<(Uuid, [u8; 32])>,
     /// Events to write to the index.
     pub documents: Vec<SearchDocument>,
     /// Queued events that are gone, deleted or not searchable: their
@@ -193,11 +202,24 @@ impl SearchOutboxBatch {
 
     /// Delete the claimed rows and commit. Call once the index holds the
     /// batch.
-    pub async fn complete(mut self) -> Result<()> {
+    pub async fn complete(self) -> Result<()> {
+        self.complete_except(&[]).await
+    }
+
+    /// Delete the claimed rows except those naming an event in `retry`, and
+    /// commit. Call once the index holds every other event of the batch; the
+    /// kept rows are claimed again by a later batch.
+    pub async fn complete_except(mut self, retry: &[[u8; 32]]) -> Result<()> {
         let community = self.tx.community();
+        let done: Vec<Uuid> = self
+            .rows
+            .iter()
+            .filter(|(_, event)| !retry.contains(event))
+            .map(|(id, _)| *id)
+            .collect();
         sqlx::query("DELETE FROM search_outbox WHERE community_id = $1 AND id = ANY($2)")
             .bind(community.as_uuid())
-            .bind(&self.row_ids)
+            .bind(&done)
             .execute(self.tx.conn())
             .await?;
         self.tx.commit().await
@@ -205,8 +227,8 @@ impl SearchOutboxBatch {
 }
 
 /// Claim up to `limit` of the oldest queued rows of one community not in
-/// `skip`, skipping rows another worker holds, and read their events' current
-/// state.
+/// `skip` and not being indexed by another worker, and read their events'
+/// current state.
 ///
 /// Returns `None` when no other active community has unclaimed rows.
 pub async fn claim_batch(
@@ -241,6 +263,19 @@ pub async fn claim_batch(
             refused.push(id);
             continue;
         };
+        // One batch per community at a time, so two workers never write
+        // different states of one message in the wrong order. The lock ends
+        // with the batch's transaction.
+        let exclusive: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, hashtext($2::text))")
+                .bind(CLAIM_LOCK_CLASS)
+                .bind(id)
+                .fetch_one(tx.conn())
+                .await?;
+        if !exclusive {
+            refused.push(id);
+            continue;
+        }
         let rows = sqlx::query(
             "SELECT id, event_id, event_created_at FROM search_outbox \
              WHERE community_id = $1 \
@@ -253,18 +288,17 @@ pub async fn claim_batch(
         .fetch_all(tx.conn())
         .await?;
         if rows.is_empty() {
-            // Another worker holds every row of this community.
+            // Another worker holds every row of this community, or its rows
+            // were completed since the candidate read.
             refused.push(id);
             continue;
         }
-        let mut row_ids = Vec::with_capacity(rows.len());
+        let mut claimed = Vec::with_capacity(rows.len());
         let mut queued = std::collections::BTreeMap::<[u8; 32], DateTime<Utc>>::new();
         for row in &rows {
-            row_ids.push(row.try_get("id")?);
-            queued.insert(
-                bytes32(row.try_get("event_id")?)?,
-                row.try_get("event_created_at")?,
-            );
+            let event = bytes32(row.try_get("event_id")?)?;
+            claimed.push((row.try_get("id")?, event));
+            queued.insert(event, row.try_get("event_created_at")?);
         }
         let documents = read_documents(&mut tx, &queued).await?;
         for document in &documents {
@@ -273,7 +307,7 @@ pub async fn claim_batch(
         let removed = queued.into_keys().collect();
         return Ok(Some(SearchOutboxBatch {
             tx,
-            row_ids,
+            rows: claimed,
             documents,
             removed,
         }));
