@@ -41,6 +41,14 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   community for the pass, so a community with a full batch of them is stuck
   until they are fixed: watch `buzz_search_index_rejected_total`. Throttling (HTTP 429, which Serverless returns while
   it scales) backs off the same way without counting as a failure.
+- Every item is written with an external version read from the database
+  clock while the batch holds its partitions, so a bulk request the cluster
+  applies late (after a timeout or a crash) cannot undo a newer write. A
+  delete's version is kept for the index's `gc_deletes` (60 seconds by
+  default). If the database clock steps back, items whose document holds a
+  newer version fail with a conflict and keep their rows queued until the
+  clock passes it: watch `buzz_search_index_version_conflicts_total`, which
+  should stay at zero.
 - The lease holder also backfills messages stored before the outbox was on.
   For each community it queues the keys of searchable messages in batches
   of 500, newest first, and records how far it got in `search_backfill`
@@ -102,6 +110,7 @@ short-lived queue entries and progress markers, not data.
 | `buzz_search_backfill_complete` | `community` | 1 once the community's backfill is complete. |
 | `buzz_search_indexed_documents_total` | `community`, `op` (`write`, `remove`) | Documents the indexer wrote or removed. Its rate is the indexing rate. |
 | `buzz_search_index_rejected_total` | `community` | Bulk items the cluster refused for good. Their rows stay queued; a steady rate needs a look at the documents or mapping. |
+| `buzz_search_index_version_conflicts_total` | `community` | Bulk items refused because the index held a newer version, which means the database clock went back. Their rows stay queued until the clock passes that version. Should stay at zero. |
 | `buzz_search_indexer_throttled_total` | | Passes the cluster throttled. |
 
 Each drain pass that indexed anything ends with an info log,
