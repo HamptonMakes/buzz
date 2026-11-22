@@ -126,7 +126,11 @@ Without `BUZZ_OPENSEARCH_URL` the flag is ignored and Postgres serves. Every
 hit is still re-read from Postgres and access-checked at every value.
 Prefix-mode searches (the bridge's `search_mode: "prefix"`) stay on Postgres
 at every value until OpenSearch supports prefix analysis; they are counted in
-`buzz_search_opensearch_skipped_total{reason="unsupported_mode"}`.
+`buzz_search_opensearch_skipped_total{reason="unsupported_mode"}`. The index
+holds only message kinds, so a search that names any other kind (people search
+names kind `0`) or names no kinds stays on Postgres at every value and is not
+shadowed; it is counted with `reason="unindexed_kinds"`. Message search names
+message kinds and follows the flag.
 
 The flag comes from the relay's feature-flag provider
 (`BUZZ_FEATURE_FLAGS_PROVIDER`). LaunchDarkly can target one community (the
@@ -145,7 +149,7 @@ BUZZ_FEATURE_FLAGS_PROVIDER=environment BUZZ_FEATURE_FLAG_SEARCH_BACKEND=1 just 
 | `buzz_search_duration_seconds{backend, role}` | Search latency per backend; `role` is `primary` (served the request) or `shadow`. |
 | `buzz_search_requests_total{backend, role, outcome}` | `outcome`: `hits`, `zero_results` (first page empty), `empty_page` (later page empty), `error` (including failed shards and engine timeouts), `timeout` (shadow deadline). Zero-result rate is `zero_results` over first-page searches. |
 | `buzz_search_shadow_overlap_ratio` | Share of the top 10 hits both backends returned, over the larger list. |
-| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `unsupported_mode`, or `shadow_busy` when 32 shadow searches were already in flight. |
+| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `unindexed_kinds` when the search named a kind the index does not hold, or no kinds; `unsupported_mode`; or `shadow_busy` when 32 shadow searches were already in flight. |
 | `buzz_search_outbox_depth` | Queued outbox rows (counted up to 1,000,000), sampled every 15 s. |
 | `buzz_search_index_lag_seconds` | Age of the oldest queued outbox row; `0` when the queue is empty. |
 

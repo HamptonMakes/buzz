@@ -22,6 +22,15 @@
 //! search runs, not a fallback: an OpenSearch failure at setting 2 still fails
 //! the search.
 //!
+//! **Unindexed kinds.** The index holds only
+//! [`buzz_db::search_outbox::SEARCHABLE_KINDS`], while Postgres searches
+//! every kind it indexes for full-text search (profiles, artifacts and
+//! more). A search that names another kind, or names no kinds and so asks
+//! for all of them, stays on Postgres at every setting and is not shadowed
+//! (`reason="unindexed_kinds"`): OpenSearch would silently drop those
+//! results. This rule comes before the mode rule, so a people search (kind
+//! 0, prefix mode) counts as `unindexed_kinds`.
+//!
 //! **Shadow.** Only first pages are compared. The OpenSearch query starts
 //! before the Postgres one, on its own task with its own deadline
 //! ([`SHADOW_DEADLINE`]) and at most [`SHADOW_MAX_IN_FLIGHT`] at once; a search that finds every slot taken
@@ -51,6 +60,8 @@ use buzz_core::CommunityId;
 use buzz_feature_flags::{EvaluationContext, FlagEvaluator, IntegerFlag};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::info;
+
+use buzz_db::search_outbox::SEARCHABLE_KINDS;
 
 use crate::opensearch::SearchIndex;
 use crate::{SearchError, SearchMode, SearchQuery, SearchResult};
@@ -190,6 +201,10 @@ impl OpenSearchBackend {
         if setting == BackendSetting::Postgres {
             return Route::Postgres;
         }
+        if !index_holds_kinds(query) {
+            skipped(setting, "unindexed_kinds");
+            return Route::Postgres;
+        }
         if query.mode != SearchMode::FullText {
             skipped(setting, "unsupported_mode");
             return Route::Postgres;
@@ -216,6 +231,14 @@ impl OpenSearchBackend {
         ));
         Route::Shadow(postgres_tx)
     }
+}
+
+/// Whether the index holds every kind `query` can return: it names kinds,
+/// and all of them are indexed. No kinds means every kind.
+fn index_holds_kinds(query: &SearchQuery) -> bool {
+    query.kinds.as_ref().is_some_and(|kinds| {
+        !kinds.is_empty() && kinds.iter().all(|kind| SEARCHABLE_KINDS.contains(kind))
+    })
 }
 
 /// Run `search` on `engine` as the primary search, recording its metrics.
@@ -343,6 +366,38 @@ mod tests {
             (-1, BackendSetting::Postgres),
         ] {
             assert_eq!(BackendSetting::from_flag_value(value), setting, "{value}");
+        }
+    }
+
+    #[test]
+    fn only_searches_of_indexed_kinds_reach_the_index() {
+        let query = |kinds: Option<Vec<i32>>| SearchQuery {
+            community: CommunityId::from_uuid(uuid::Uuid::nil()),
+            q: "word".into(),
+            channel_scope: crate::ChannelScope::Any,
+            kinds,
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: crate::SearchMode::FullText,
+            sort: crate::SearchSort::Relevance,
+        };
+        for (kinds, indexed) in [
+            (Some(vec![9]), true),
+            (Some(vec![9, 40002, 40008, 45001, 45003]), true),
+            (Some(vec![0]), false),
+            (Some(vec![45010]), false),
+            (Some(vec![9, 0]), false),
+            (Some(vec![]), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                index_holds_kinds(&query(kinds.clone())),
+                indexed,
+                "{kinds:?}"
+            );
         }
     }
 
