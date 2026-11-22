@@ -267,7 +267,7 @@ impl Indexer {
             let community = batch.community();
             let outcome = match self
                 .index
-                .write(community, &batch.documents, &batch.removed)
+                .write(community, &batch.documents, &batch.removed, batch.version)
                 .await
             {
                 Ok(outcome) => outcome,
