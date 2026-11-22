@@ -666,6 +666,63 @@ async fn at_two_a_deleted_message_left_in_the_index_is_dropped() {
     f.delete().await;
 }
 
+/// At 2, a member removed from a private channel no longer finds its
+/// messages, though the index still files them under that channel.
+/// Mutation: keep the reader's cached channel access after the removal →
+/// RED. Skipping only the per-hit channel check stays green: the query is
+/// already scoped to the reader's channels.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires Postgres, Redis and OpenSearch"]
+async fn at_two_a_removed_member_no_longer_finds_the_channel() {
+    let f = Fixture::on_opensearch().await;
+    let c = f.community().await;
+    f.set_backend(&c, 2);
+    let reader = Keys::generate();
+    let membership = |kind: u16| {
+        EventBuilder::new(Kind::Custom(kind), "")
+            .tag(Tag::parse(["h", &c.private.to_string()]).unwrap())
+            .tag(Tag::public_key(reader.public_key()))
+    };
+    f.publish(&c, membership(9000)).await;
+    let members = word("members");
+    let message = f.post(&c, c.private, &members).await;
+    f.index_as(&c, &message, &members, c.private).await;
+    assert_eq!(
+        f.search(&c, &reader, &members).await,
+        Ok(vec![message.id.to_hex()])
+    );
+
+    f.publish(&c, membership(9001)).await;
+    assert_eq!(f.search(&c, &reader, &members).await, Ok(vec![]));
+    f.delete().await;
+}
+
+/// At 2, a document filed under one community for a message of another is
+/// never returned: the relay re-reads each hit in the searching community.
+/// Channel ids are unique only within a community, so the other community
+/// holds a channel with the same id as one the reader belongs to, and the
+/// channel check alone would let the hit through.
+/// Mutation: re-read hits without the community → RED.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires Postgres, Redis and OpenSearch"]
+async fn at_two_a_document_of_another_community_is_dropped() {
+    let f = Fixture::on_opensearch().await;
+    let here = f.community().await;
+    let there = f.community().await;
+    f.set_backend(&here, 2);
+    let twin = EventBuilder::new(Kind::Custom(9007), "")
+        .tag(Tag::parse(["h", &here.open.to_string()]).unwrap())
+        .tag(Tag::parse(["name", "twin"]).unwrap());
+    f.publish(&there, twin).await;
+    let elsewhere = word("elsewhere");
+    let message = f.post(&there, here.open, &elsewhere).await;
+    // Misfiled: the index says the other community's message is here, in
+    // the same-id channel this community's owner can read.
+    f.index_as(&here, &message, &elsewhere, here.open).await;
+    assert_eq!(f.search(&here, &here.owner, &elsewhere).await, Ok(vec![]));
+    f.delete().await;
+}
+
 /// The outbox gauges follow the queue: with the indexer paused, depth counts
 /// the queued rows and lag ages with the oldest; once the indexer drains the
 /// queue, both read zero. Runs on a scratch database so the counts are this
