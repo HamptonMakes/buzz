@@ -520,3 +520,45 @@ async fn debug_mode_returns_query_match_and_age() {
     assert_eq!(in_order, ids, "equal matches, newest first");
     fx.teardown(pool).await;
 }
+
+/// Relevance pages tile one order, so paging through a long list of
+/// matches, as the relay's search scan does, returns each message once. The
+/// order holds within the rescore window, where relevance results end: past
+/// it, hits would keep a rank without the age factor and interleave with
+/// the window's.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn relevance_pages_tile_one_order_up_to_the_rescore_window() {
+    let (pool, fx, c) = setup().await;
+    for _ in 0..1_100 {
+        post(&pool, c, "quarterly report", 365 * DAY).await;
+    }
+    let page = |page: u32, per_page: u32| SearchQuery {
+        page,
+        per_page,
+        ..query(c, "quarterly", SearchMode::FullText, SearchSort::Relevance)
+    };
+    let hits = |page: SearchQuery| {
+        let fx = &fx;
+        async move { fx.service().search(&page).await.expect("search").hits }
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for n in 1..=10 {
+        let hits = hits(page(n, 100)).await;
+        assert_eq!(hits.len(), 100, "page {n} is full");
+        for hit in hits {
+            assert!(seen.insert(hit.event_id), "page {n} repeats a hit");
+        }
+    }
+    assert!(
+        hits(page(11, 100)).await.is_empty(),
+        "results end at the window"
+    );
+    assert_eq!(
+        hits(page(4, 300)).await.len(),
+        100,
+        "a page across it is cut"
+    );
+    fx.teardown(pool).await;
+}

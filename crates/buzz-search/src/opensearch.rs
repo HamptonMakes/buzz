@@ -363,11 +363,23 @@ impl SearchIndex {
         if offset + i64::from(per_page) > MAX_RESULT_WINDOW {
             return empty();
         }
+        let rescored = query.sort == SearchSort::Relevance;
+        // Relevance results end at the rescore window: hits past it keep Q
+        // without the age factor, so a page reaching past it would mix them
+        // with the window's and repeat or skip hits of other pages.
+        let size = if rescored {
+            (relevance::RESCORE_WINDOW - offset).min(i64::from(per_page))
+        } else {
+            i64::from(per_page)
+        };
+        let Ok(size @ 1..) = u32::try_from(size) else {
+            return empty();
+        };
         let now = chrono::Utc::now().timestamp();
         let response = self
             .client
             .search(SearchParts::Index(&[&self.alias]))
-            .body(search_body(query, text, offset, per_page, now))
+            .body(search_body(query, text, offset, size, now))
             .send()
             .await
             .map_err(transport_error)?;
@@ -379,18 +391,16 @@ impl SearchIndex {
         if body["_shards"]["failed"].as_u64().unwrap_or(0) > 0 {
             return Err(SearchError::Engine("search shards failed".into()));
         }
-        let rescored = query.sort == SearchSort::Relevance;
         let hits = body["hits"]["hits"]
             .as_array()
             .into_iter()
             .flatten()
-            .enumerate()
-            .map(|(position, hit)| {
+            .map(|hit| {
                 let hit = parse_hit(hit)?;
                 let age = relevance::age_factor(hit.created_at, now);
-                // Only the rescore window's ranks carry the age factor.
-                let aged = rescored && offset + (position as i64) < relevance::RESCORE_WINDOW;
-                let query_match = if aged {
+                // Every relevance hit is in the rescore window, so its rank
+                // carries the age factor.
+                let query_match = if rescored {
                     (f64::from(hit.rank) / age) as f32
                 } else {
                     hit.rank

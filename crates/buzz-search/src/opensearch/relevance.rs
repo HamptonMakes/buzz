@@ -92,8 +92,15 @@ const PHRASE_WEIGHT: f64 = 2.0;
 const PROXIMITY_WEIGHT: f64 = 1.0;
 const PROXIMITY_SLOP: u32 = 4;
 
-/// How many of the best hits by Q the age factor reorders.
-pub(super) const RESCORE_WINDOW: i64 = 500;
+/// How many of the best hits by Q the age factor reorders, and so how far
+/// relevance results go: past the window a hit would keep Q alone and
+/// interleave with the window's, so pages would repeat or skip hits. It
+/// covers the relay's search scan, which pages through up to
+/// [`buzz_db::DEFAULT_MAX_PAGE_LIMIT`] candidates. On a million messages,
+/// 1,000 rather than 500 added 3 ms to a one-word search (29 to 32 ms) and
+/// nothing measurable to longer ones, whose matching costs far more.
+pub(super) const RESCORE_WINDOW: i64 = 1_000;
+const _: () = assert!(RESCORE_WINDOW >= buzz_db::DEFAULT_MAX_PAGE_LIMIT);
 /// T never falls below this, so old exact matches survive.
 const AGE_FLOOR: f64 = 0.2;
 /// Age at which the decaying part of T has halved.
