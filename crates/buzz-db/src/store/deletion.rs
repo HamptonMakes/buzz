@@ -9719,7 +9719,8 @@ DROP FUNCTION protect_community_deletion_manifest_keys();
     /// Approve, claim, fence, drain and remove bindings, leaving the request
     /// ready for `purge_postgres`.
     /// Once a community is fenced for deletion, admission refuses its writes
-    /// (and so its outbox rows), and claims and backfill skip it; the purge
+    /// (and so its outbox rows), claims and backfill skip it, and its rows do
+    /// not count against the backfill bound; the purge
     /// removes its outbox rows and backfill progress and keeps another
     /// community's.
     #[tokio::test]
@@ -9820,6 +9821,12 @@ DROP FUNCTION protect_community_deletion_manifest_keys();
             "claims skip a fenced community"
         );
         drop(batch);
+        // The fenced community's rows cannot drain before the purge, so they
+        // do not count against the backfill bound of the others.
+        assert_eq!(queued(bystander).await, 2);
+        assert!(crate::search_backfill::outbox_below(&db.pool, 3)
+            .await
+            .expect("outbox depth"));
 
         let deleted = store.purge_postgres(&token).await.expect("purge postgres");
         assert_eq!(deleted.get("search_outbox"), Some(&2));

@@ -11,7 +11,11 @@ shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-se
   rolled-back write queues nothing, and admission never calls OpenSearch.
   Deletions (NIP-09, NIP-29 and moderation) and account-deletion scrubs queue
   a row for each removed message the same way. A message edit (kind 40003),
-  or a deletion of one, queues the message it edits.
+  or a deletion of one, queues the message it edits. Account deletion
+  (`buzz-admin user-deletions`) needs no OpenSearch setting: it queues
+  whenever `search_outbox` or `search_backfill` holds a row, which is once
+  an indexing relay has run against the database. To stop indexing for
+  good, unset `BUZZ_OPENSEARCH_URL` everywhere, then empty both tables.
 - One relay instance holds the indexer lease (a Postgres session advisory
   lock). Instances that start together spread their lease attempts with
   jitter, and followers check the lease every 2.5 to 5 seconds. The lease
