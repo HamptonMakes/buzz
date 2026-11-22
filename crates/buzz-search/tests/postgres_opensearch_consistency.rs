@@ -25,6 +25,9 @@
 //! - `BUZZ_TEST_CONSISTENCY_LATE_APPLY`: `1` lets a request stalled when its
 //!   indexer crashes reach the cluster afterwards, as a bulk request the
 //!   cluster is still working through when its client times out would.
+//! - `BUZZ_TEST_CONSISTENCY_CLOCK_BACK`: `1` moves the versions the indexer
+//!   writes as if the database clock jumped 0.3-3 s ahead for a stretch of
+//!   indexing and was then corrected, stepping back.
 
 #[allow(unused_macros, unused_imports)]
 mod search_suite;
@@ -82,6 +85,9 @@ struct Faults {
     lost_response: u32,
     stall: u32,
     late_apply: bool,
+    /// Whether the driver moves the version source: it jumps forward for
+    /// a stretch, then steps back.
+    clock_back: bool,
 }
 
 struct ProxyState {
@@ -96,6 +102,9 @@ struct ProxyState {
     /// Requests forwarded after their client had gone.
     late_applied: AtomicUsize,
     bulks: AtomicUsize,
+    /// Microseconds added to every external version in a bulk request, as
+    /// if the database clock the versions are read from were off by that.
+    skew: AtomicI64,
 }
 
 struct Proxy {
@@ -117,6 +126,7 @@ impl Proxy {
             pending: AtomicUsize::new(0),
             late_applied: AtomicUsize::new(0),
             bulks: AtomicUsize::new(0),
+            skew: AtomicI64::new(0),
         });
         let app = axum::Router::new()
             .fallback(proxy_request)
@@ -144,6 +154,7 @@ impl Proxy {
         *self.state.faults.lock().expect("faults") = faults;
         if faults.is_none() {
             *self.state.outage_until.lock().expect("outage") = None;
+            self.state.skew.store(0, Ordering::SeqCst);
         }
     }
 
@@ -192,6 +203,33 @@ async fn forward(
     Ok((status, content_type, bytes))
 }
 
+/// `body` with `skew` added to the external version of every action.
+fn skewed(body: &[u8], skew: i64) -> axum::body::Bytes {
+    let text = std::str::from_utf8(body).expect("utf-8 bulk body");
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.lines() {
+        let mut value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let version = ["index", "delete"]
+            .iter()
+            .find_map(|key| value.get(*key))
+            .filter(|_| value.as_object().is_some_and(|object| object.len() == 1))
+            .and_then(|action| action["version"].as_i64());
+        match version {
+            Some(version) => {
+                for key in ["index", "delete"] {
+                    if let Some(action) = value.get_mut(key) {
+                        action["version"] = json!(version + skew);
+                    }
+                }
+                out.push_str(&value.to_string());
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    axum::body::Bytes::from(out)
+}
+
 /// The item actions of an NDJSON bulk body: each action line and, for an
 /// index action, its source line.
 fn bulk_items(body: &[u8]) -> Vec<(Value, Option<String>)> {
@@ -225,6 +263,12 @@ async fn proxy_request(
     let content_type = parts.headers.get("content-type").cloned();
     let faults = *state.faults.lock().expect("faults");
     let bulk = parts.uri.path().ends_with("/_bulk");
+    let skew = state.skew.load(Ordering::SeqCst);
+    let body = if bulk && skew != 0 {
+        skewed(&body, skew)
+    } else {
+        body
+    };
     let Some(faults) = faults.filter(|_| bulk) else {
         return match forward(&state, parts.method, &path, content_type, body).await {
             Ok((status, content_type, bytes)) => {
@@ -971,6 +1015,7 @@ fn plan(seed: u64, rng: &mut StdRng) -> Plan {
             lost_response: rng.random_range(0..8),
             stall: rng.random_range(0..20),
             late_apply: env_or("BUZZ_TEST_CONSISTENCY_LATE_APPLY", "0") == "1",
+            clock_back: env_or("BUZZ_TEST_CONSISTENCY_CLOCK_BACK", "0") == "1",
         },
     }
 }
@@ -981,17 +1026,31 @@ async fn bounded_drain(indexer: &Indexer) {
 }
 
 /// Index concurrently with the writers until `done`, injecting crashes,
-/// overlapping indexers and outages.
+/// overlapping indexers, outages and, with `clock_back`, clock jumps.
 async fn driver(
     first: Indexer,
     second: Indexer,
     proxy: Arc<Proxy>,
     done: Arc<AtomicBool>,
     seed: u64,
-) -> (usize, usize, usize) {
+    clock_back: bool,
+) -> (usize, usize, usize, usize) {
     let mut rng = StdRng::seed_from_u64(seed ^ 0xd21_7e5);
-    let (mut crashes, mut overlaps, mut outages) = (0, 0, 0);
+    let (mut crashes, mut overlaps, mut outages, mut jumps) = (0, 0, 0, 0);
     while !done.load(Ordering::SeqCst) {
+        if clock_back && rng.random_bool(0.15) {
+            // The clock jumps 0.3-3 s ahead for a stretch of indexing,
+            // then is corrected: it steps back.
+            proxy
+                .state
+                .skew
+                .store(rng.random_range(300_000..3_000_000), Ordering::SeqCst);
+            bounded_drain(&first).await;
+            tokio::time::sleep(Duration::from_millis(rng.random_range(0..200))).await;
+            proxy.state.skew.store(0, Ordering::SeqCst);
+            jumps += 1;
+            continue;
+        }
         match rng.random_range(0..100u32) {
             0..=44 => bounded_drain(&first).await,
             45..=69 => {
@@ -1021,7 +1080,7 @@ async fn driver(
         }
         tokio::time::sleep(Duration::from_millis(rng.random_range(0..20))).await;
     }
-    (crashes, overlaps, outages)
+    (crashes, overlaps, outages, jumps)
 }
 
 /// What one community's document should hold, read from Postgres.
@@ -1288,6 +1347,7 @@ struct RunReport {
     overlaps: usize,
     outages: usize,
     late_applied: usize,
+    jumps: usize,
 }
 
 async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
@@ -1332,6 +1392,7 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
         proxy.clone(),
         done.clone(),
         seed,
+        plan.faults.clock_back,
     ));
     let writers: Vec<_> = (0..world.authors.len())
         .map(|author| {
@@ -1349,14 +1410,19 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
     }
     done.store(true, Ordering::SeqCst);
     backfill.await.expect("backfill task");
-    let (crashes, overlaps, outages) = driving.await.expect("driver");
+    let (crashes, overlaps, outages, jumps) = driving.await.expect("driver");
 
-    // Let everything drain with the faults off.
+    // Let everything drain with the faults off. A pass can still fail
+    // while documents hold versions from a clock that jumped ahead; their
+    // rows stay queued until the clock passes them.
     proxy.set_faults(None);
+    let mut last_error = None;
     let drained = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let queued = first.backfill().await.expect("final backfill");
-            first.drain().await.expect("final drain");
+            if let Err(error) = first.drain().await {
+                last_error = Some(error.to_string());
+            }
             let incomplete: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM communities c LEFT JOIN search_backfill b ON b.community_id = c.id \
                  WHERE b.completed_at IS NULL",
@@ -1377,7 +1443,9 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
     .await;
     let mut violations = Vec::new();
     if drained.is_err() {
-        violations.push("the outbox did not drain within 120 s".to_string());
+        violations.push(format!(
+            "the outbox did not drain within 120 s; last drain error: {last_error:?}"
+        ));
     }
     violations.extend(verify(db, &world, &prefix).await);
     let report = RunReport {
@@ -1387,6 +1455,7 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
         overlaps,
         outages,
         late_applied: proxy.state.late_applied.load(Ordering::SeqCst),
+        jumps,
     };
     if violations.is_empty() {
         direct.delete().await.expect("delete index");
@@ -1395,7 +1464,7 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
         violations.insert(
             0,
             format!(
-                "seed {seed}: {plan:?}, index prefix {prefix} kept, {} messages, {} bulks, {crashes} crashes, {overlaps} overlaps, {outages} outages, {} late",
+                "seed {seed}: {plan:?}, index prefix {prefix} kept, {} messages, {} bulks, {crashes} crashes, {overlaps} overlaps, {outages} outages, {} late, {jumps} clock jumps",
                 report.messages, report.bulks, report.late_applied
             ),
         );
@@ -1418,14 +1487,15 @@ async fn the_index_converges_on_postgres_under_interleaving() {
         let started = Instant::now();
         match tokio::time::timeout(Duration::from_secs(300), run(&db, seed, ops)).await {
             Ok(Ok(report)) => eprintln!(
-                "seed {seed}: ok in {:?}: {} messages, {} bulks, {} crashes, {} overlaps, {} outages, {} late",
+                "seed {seed}: ok in {:?}: {} messages, {} bulks, {} crashes, {} overlaps, {} outages, {} late, {} clock jumps",
                 started.elapsed(),
                 report.messages,
                 report.bulks,
                 report.crashes,
                 report.overlaps,
                 report.outages,
-                report.late_applied
+                report.late_applied,
+                report.jumps
             ),
             Ok(Err(violations)) => {
                 eprintln!("seed {seed}: FAILED\n  {}", violations.join("\n  "));
