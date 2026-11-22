@@ -188,7 +188,12 @@ impl Fixture {
             mentions: Vec::new(),
         };
         self.index
-            .write(community.tenant.community(), &[document], &[])
+            .write(
+                community.tenant.community(),
+                &[document],
+                &[],
+                chrono::Utc::now().timestamp_micros(),
+            )
             .await
             .expect("index document");
         self.index.refresh().await.expect("refresh");

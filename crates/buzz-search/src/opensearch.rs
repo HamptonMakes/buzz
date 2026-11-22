@@ -23,6 +23,7 @@ use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::http::Url;
 use opensearch::indices::IndicesRefreshParts;
 use opensearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesGetAliasParts};
+use opensearch::params::VersionType;
 use opensearch::{BulkOperation, BulkParts, OpenSearch, SearchParts};
 use serde_json::{json, Value};
 
@@ -48,6 +49,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The status OpenSearch throttles with, notably Serverless while it scales.
 const THROTTLED: u16 = 429;
+/// Item status when the index holds the document at a newer version.
+const VERSION_CONFLICT: u64 = 409;
 
 /// What a bulk write did, item by item.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -223,6 +226,11 @@ impl SearchIndex {
     /// the alias, so a missing index fails the write instead of being created
     /// with a dynamic mapping.
     ///
+    /// Every item carries `version` as an external version, so the cluster
+    /// keeps the newest state of each document: a request it applies after
+    /// its writer gave up cannot undo a later write. An item the index
+    /// already holds at a newer version succeeds.
+    ///
     /// A throttled request (HTTP 429) comes back as an outcome in which every
     /// item failed; any other failed request is an error.
     pub async fn write(
@@ -230,6 +238,7 @@ impl SearchIndex {
         community: CommunityId,
         documents: &[SearchDocument],
         removed: &[[u8; 32]],
+        version: i64,
     ) -> Result<BulkOutcome, SearchError> {
         if documents.is_empty() && removed.is_empty() {
             return Ok(BulkOutcome::default());
@@ -242,6 +251,8 @@ impl SearchIndex {
                 BulkOperation::index(document_source(community, document))
                     .id(document_id(community, &document.event_id))
                     .index(index)
+                    .version(version)
+                    .version_type(VersionType::External)
                     .into(),
             );
         }
@@ -249,6 +260,8 @@ impl SearchIndex {
             operations.push(
                 BulkOperation::delete(document_id(community, event_id))
                     .index(index)
+                    .version(version)
+                    .version_type(VersionType::External)
                     .into(),
             );
         }
@@ -289,10 +302,11 @@ impl SearchIndex {
             let Some(result) = item.as_object().and_then(|item| item.values().next()) else {
                 return Err(SearchError::Engine("malformed bulk response item".into()));
             };
-            if result.get("error").is_none() {
+            let status = result["status"].as_u64().unwrap_or(0);
+            // A version conflict means a later write already landed.
+            if result.get("error").is_none() || status == VERSION_CONFLICT {
                 continue;
             }
-            let status = result["status"].as_u64().unwrap_or(0);
             outcome.throttled |= status == u64::from(THROTTLED);
             if rejects(status) {
                 outcome.rejected += 1;

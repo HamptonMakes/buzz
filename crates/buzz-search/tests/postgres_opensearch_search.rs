@@ -46,6 +46,7 @@ use std::time::Duration;
 use buzz_core::CommunityId;
 use buzz_db::channel::{ChannelType, ChannelVisibility};
 use buzz_db::event::ThreadMetadataParams;
+use buzz_db::search_outbox::SearchDocument;
 use buzz_db::user_deletion::content_batches::ContentBatchOptions;
 use buzz_db::user_deletion::ExecutionMode;
 use buzz_db::{search_outbox, Db, DbConfig, DeletionTarget};
@@ -1100,6 +1101,69 @@ async fn a_change_during_indexing_is_indexed_afterwards() {
         find(&service, community, "secondword").await,
         vec![*original.id.as_bytes()]
     );
+    index.delete().await.expect("delete index");
+}
+
+/// The index keeps each document's newest version: a bulk request the
+/// cluster applies after a later one, as when its indexer timed out or
+/// crashed with the request in flight, changes nothing and still succeeds,
+/// so its rows are not retried for ever.
+/// Mutation: write without the external version → RED.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn a_late_write_cannot_undo_a_newer_one() {
+    let db = sync_db().await;
+    let (index, prefix) = sync_index().await;
+    let community = search_suite::mk_community(
+        db.pool(),
+        &format!("late-{}.example", Uuid::new_v4().simple()),
+    )
+    .await;
+    let keys = Keys::generate();
+    let channel = channel(&db, community, &keys).await;
+    let event = channel_message(&keys, channel, 9, "firstword", &[], 0);
+    db.insert_event(community, &event, Some(channel))
+        .await
+        .expect("insert");
+    let document = |content: &str| SearchDocument {
+        event_id: event.id.to_bytes(),
+        kind: 9,
+        pubkey: event.pubkey.to_bytes(),
+        channel_id: Some(channel),
+        created_at: signed_at(&event),
+        content: content.into(),
+        channel_type: Some("stream".into()),
+        author_is_agent: false,
+        thread_root: None,
+        mentions: Vec::new(),
+    };
+    let write = |documents: Vec<SearchDocument>, removed: Vec<[u8; 32]>, version: i64| {
+        let index = index.clone();
+        async move {
+            let outcome = index
+                .write(community, &documents, &removed, version)
+                .await
+                .expect("write");
+            assert!(outcome.failed.is_empty(), "{outcome:?}");
+        }
+    };
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+
+    // The edit's write lands first, then the original's late one.
+    write(vec![document("secondword")], vec![], 2).await;
+    write(vec![document("firstword")], vec![], 1).await;
+    index.refresh().await.expect("refresh");
+    assert!(find(&service, community, "firstword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "secondword").await,
+        vec![event.id.to_bytes()]
+    );
+
+    // The removal lands first, then the edit's late write.
+    write(vec![], vec![event.id.to_bytes()], 3).await;
+    write(vec![document("secondword")], vec![], 2).await;
+    index.refresh().await.expect("refresh");
+    assert!(!indexed(&prefix, community, &event).await);
     index.delete().await.expect("delete index");
 }
 

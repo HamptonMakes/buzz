@@ -208,6 +208,11 @@ pub struct SearchOutboxBatch {
     /// Queued events that are gone, deleted or not searchable: their
     /// documents must be removed from the index.
     pub removed: Vec<[u8; 32]>,
+    /// The database clock in microseconds, read while the batch holds its
+    /// partitions. A later batch of the same event can only be claimed once
+    /// this one ends, so it reads a later state and a larger version: the
+    /// index can keep the newest write by this external version.
+    pub version: i64,
 }
 
 impl SearchOutboxBatch {
@@ -368,6 +373,10 @@ pub async fn claim_batch_share(
             queued.insert(event, row.try_get("event_created_at")?);
         }
         let documents = read_documents(&mut tx, &queued).await?;
+        let version: i64 =
+            sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+                .fetch_one(tx.conn())
+                .await?;
         for document in &documents {
             queued.remove(&document.event_id);
         }
@@ -377,6 +386,7 @@ pub async fn claim_batch_share(
             rows: claimed,
             documents,
             removed,
+            version,
         }));
     }
     Ok(None)
