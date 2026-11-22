@@ -251,9 +251,9 @@ pub struct SearchOutboxBatch {
     /// The next value of the `search_index_version` sequence, read while
     /// the batch holds its partitions. A later batch of the same event can
     /// only be claimed once this one ends, so it reads a later state and,
-    /// since the sequence never goes back, a larger version: the index keeps
-    /// the newest write by this external version, even when an older batch's
-    /// request lands after it.
+    /// since the sequence does not repeat values while Postgres runs, a
+    /// larger version: the index keeps the newest write by this external
+    /// version, even when an older batch's request lands after it.
     pub version: i64,
 }
 
