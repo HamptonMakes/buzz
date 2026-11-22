@@ -163,7 +163,7 @@ impl SearchService {
         match self
             .opensearch
             .as_ref()
-            .and_then(|opensearch| opensearch.serving(query.community))
+            .and_then(|opensearch| opensearch.serving(query))
         {
             Some(index) => index.search_scored(query).await,
             None => query::search(&self.pool, query).await.map(Into::into),

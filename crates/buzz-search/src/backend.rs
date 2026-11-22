@@ -190,10 +190,12 @@ impl OpenSearchBackend {
         self.shadow_deadline = deadline;
     }
 
-    /// The index serving `community`'s searches, if the setting is
-    /// OpenSearch.
-    pub(crate) fn serving(&self, community: CommunityId) -> Option<&SearchIndex> {
-        (self.selection.setting(community) == BackendSetting::OpenSearch).then_some(&self.index)
+    /// The index serving `query`, if the setting is OpenSearch and the
+    /// index holds every kind it asks for.
+    pub(crate) fn serving(&self, query: &SearchQuery) -> Option<&SearchIndex> {
+        (self.selection.setting(query.community) == BackendSetting::OpenSearch
+            && index_holds_kinds(query))
+        .then_some(&self.index)
     }
 
     /// Decide where `query` runs, starting the shadow search if it gets one.
