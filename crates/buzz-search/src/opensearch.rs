@@ -61,6 +61,12 @@ pub struct BulkOutcome {
     /// retrying them fails the same way until the document or mapping
     /// changes.
     pub rejected: usize,
+    /// How many of those the index already held at this version or a newer
+    /// one (HTTP 409). A request applied after its batch ended has no one
+    /// reading its response, and a live batch holds its events' partitions,
+    /// so it is their newest writer: its conflict means the version source
+    /// went back or repeated, and its newer state must stay queued.
+    pub conflicts: usize,
     /// Whether OpenSearch throttled the request or any item (HTTP 429).
     pub throttled: bool,
     /// The first failure's error type: a fixed description, never content.
@@ -229,7 +235,7 @@ impl SearchIndex {
     /// Every item carries `version` as an external version, so the cluster
     /// keeps the newest state of each document: a request it applies after
     /// its writer gave up cannot undo a later write. An item the index
-    /// already holds at a newer version succeeds.
+    /// already holds at this version or a newer one fails as a conflict.
     ///
     /// A throttled request (HTTP 429) comes back as an outcome in which every
     /// item failed; any other failed request is an error.
@@ -283,6 +289,7 @@ impl SearchIndex {
             return Ok(BulkOutcome {
                 failed: events,
                 rejected: 0,
+                conflicts: 0,
                 throttled: true,
                 reason: Some(format!("HTTP {THROTTLED}")),
             });
@@ -302,10 +309,12 @@ impl SearchIndex {
             let Some(result) = item.as_object().and_then(|item| item.values().next()) else {
                 return Err(SearchError::Engine("malformed bulk response item".into()));
             };
-            let status = result["status"].as_u64().unwrap_or(0);
-            // A version conflict means a later write already landed.
-            if result.get("error").is_none() || status == VERSION_CONFLICT {
+            if result.get("error").is_none() {
                 continue;
+            }
+            let status = result["status"].as_u64().unwrap_or(0);
+            if status == VERSION_CONFLICT {
+                outcome.conflicts += 1;
             }
             outcome.throttled |= status == u64::from(THROTTLED);
             if rejects(status) {
