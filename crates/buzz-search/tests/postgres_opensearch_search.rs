@@ -40,6 +40,7 @@ use std::time::Duration;
 use buzz_core::CommunityId;
 use buzz_db::channel::{ChannelType, ChannelVisibility};
 use buzz_db::event::ThreadMetadataParams;
+use buzz_db::search_outbox::SearchDocument;
 use buzz_db::user_deletion::content_batches::ContentBatchOptions;
 use buzz_db::user_deletion::ExecutionMode;
 use buzz_db::{search_outbox, Db, DbConfig, DeletionTarget};
@@ -1043,6 +1044,148 @@ async fn a_change_during_indexing_is_indexed_afterwards() {
     assert_eq!(
         find(&service, community, "secondword").await,
         vec![*original.id.as_bytes()]
+    );
+    index.delete().await.expect("delete index");
+}
+
+/// A stored channel message's document with `content` as its text.
+fn document_of(event: &Event, channel: Uuid, content: &str) -> SearchDocument {
+    SearchDocument {
+        event_id: event.id.to_bytes(),
+        kind: 9,
+        pubkey: event.pubkey.to_bytes(),
+        channel_id: Some(channel),
+        created_at: signed_at(event),
+        content: content.into(),
+        channel_type: Some("stream".into()),
+        author_is_agent: false,
+        thread_root: None,
+        mentions: Vec::new(),
+    }
+}
+
+/// A community of its own with one channel, and the channel owner's keys.
+async fn late_community(db: &Db) -> (CommunityId, Keys, Uuid) {
+    let community = search_suite::mk_community(
+        db.pool(),
+        &format!("late-{}.example", Uuid::new_v4().simple()),
+    )
+    .await;
+    let keys = Keys::generate();
+    let channel = channel(db, community, &keys).await;
+    (community, keys, channel)
+}
+
+/// The database clock in microseconds, as a batch reads its version.
+async fn database_clock(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+        .fetch_one(db.pool())
+        .await
+        .expect("database clock")
+}
+
+/// The index keeps each document's newest version: a bulk request the
+/// cluster applies after a later one, as when its indexer timed out or
+/// crashed with the request in flight, changes nothing. Its items come back
+/// as conflicts, which nobody reads: its batch has ended.
+/// Mutation: write without the external version → RED.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn a_late_write_cannot_undo_a_newer_one() {
+    let db = sync_db().await;
+    let (index, prefix) = sync_index().await;
+    let (community, keys, channel) = late_community(&db).await;
+    let event = channel_message(&keys, channel, 9, "firstword", &[], 0);
+    db.insert_event(community, &event, Some(channel))
+        .await
+        .expect("insert");
+    let document = |content: &str| document_of(&event, channel, content);
+    let write = |documents: Vec<SearchDocument>, removed: Vec<[u8; 32]>, version: i64| {
+        let index = index.clone();
+        async move {
+            index
+                .write(community, &documents, &removed, version)
+                .await
+                .expect("write")
+                .conflicts
+        }
+    };
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+
+    // The edit's write lands first, then the original's late one.
+    assert_eq!(write(vec![document("secondword")], vec![], 2).await, 0);
+    assert_eq!(write(vec![document("firstword")], vec![], 1).await, 1);
+    index.refresh().await.expect("refresh");
+    assert!(find(&service, community, "firstword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "secondword").await,
+        vec![event.id.to_bytes()]
+    );
+
+    // The removal lands first, then the edit's late write.
+    assert_eq!(write(vec![], vec![event.id.to_bytes()], 3).await, 0);
+    assert_eq!(write(vec![document("secondword")], vec![], 2).await, 1);
+    index.refresh().await.expect("refresh");
+    assert!(!indexed(&prefix, community, &event).await);
+    index.delete().await.expect("delete index");
+}
+
+/// A live batch is its events' newest writer, so a conflict it meets means
+/// the database clock went back: here the document was written while the
+/// clock ran ahead. The newer state stays queued and the pass fails, and
+/// once the clock passes the version the index holds, it is written.
+/// Mutation: count a version conflict as written → RED.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn a_newer_state_below_the_held_version_stays_queued() {
+    let db = sync_db().await;
+    let (index, _prefix) = sync_index().await;
+    let (community, keys, channel) = late_community(&db).await;
+    let original = channel_message(&keys, channel, 9, "firstword", &[], 0);
+    db.insert_event(community, &original, Some(channel))
+        .await
+        .expect("insert");
+    let ahead = database_clock(&db).await + 2_000_000;
+    let outcome = index
+        .write(
+            community,
+            &[document_of(&original, channel, "firstword")],
+            &[],
+            ahead,
+        )
+        .await
+        .expect("write ahead");
+    assert!(outcome.failed.is_empty(), "{outcome:?}");
+    let edit = channel_message(
+        &keys,
+        channel,
+        40003,
+        "secondword",
+        &[&["e", &original.id.to_hex()]],
+        1,
+    );
+    db.insert_event(community, &edit, Some(channel))
+        .await
+        .expect("insert edit");
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    let indexer = Indexer::new(db.clone(), index.clone());
+
+    assert!(indexer.drain().await.is_err(), "a conflict fails the pass");
+    assert!(search_outbox::depth(db.pool()).await.expect("depth") > 0);
+    index.refresh().await.expect("refresh");
+    assert!(find(&service, community, "secondword").await.is_empty());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while database_clock(&db).await <= ahead {
+        assert!(tokio::time::Instant::now() < deadline, "the clock stalled");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drain(&indexer, &index).await;
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+    assert!(find(&service, community, "firstword").await.is_empty());
+    assert_eq!(
+        find(&service, community, "secondword").await,
+        vec![original.id.to_bytes()]
     );
     index.delete().await.expect("delete index");
 }

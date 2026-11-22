@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use buzz_db::{search_backfill, search_outbox, Db, DbError};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::opensearch::SearchIndex;
 use crate::SearchError;
@@ -267,7 +267,7 @@ impl Indexer {
             let community = batch.community();
             let outcome = match self
                 .index
-                .write(community, &batch.documents, &batch.removed)
+                .write(community, &batch.documents, &batch.removed, batch.version)
                 .await
             {
                 Ok(outcome) => outcome,
@@ -311,8 +311,17 @@ impl Indexer {
                 return Err(IndexerError::Throttled);
             }
             if outcome.rejected > 0 {
-                metrics::counter!("buzz_search_index_rejected_total", "community" => label)
+                metrics::counter!("buzz_search_index_rejected_total", "community" => label.clone())
                     .increment(outcome.rejected as u64);
+            }
+            if outcome.conflicts > 0 {
+                // This batch is its events' newest writer, so the index can
+                // hold a newer version only if the database clock went back
+                // or repeated. Keep the rows: the retry carries a later
+                // version once the clock passes the one held.
+                error!(%community, items = outcome.conflicts, "search index holds a newer version than the batch writing it; the database clock went back; its rows stay queued");
+                metrics::counter!("buzz_search_index_version_conflicts_total", "community" => label)
+                    .increment(outcome.conflicts as u64);
             }
             if outcome.rejected == outcome.failed.len() {
                 warn!(%community, items = outcome.rejected, reason, "search index rejected documents; their rows stay queued");

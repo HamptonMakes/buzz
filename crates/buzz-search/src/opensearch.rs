@@ -20,6 +20,7 @@ use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::http::Url;
 use opensearch::indices::IndicesRefreshParts;
 use opensearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts};
+use opensearch::params::VersionType;
 use opensearch::{BulkOperation, BulkParts, OpenSearch, SearchParts};
 use serde_json::{json, Value};
 
@@ -41,6 +42,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The status OpenSearch throttles with, notably Serverless while it scales.
 const THROTTLED: u16 = 429;
+/// Item status when the index holds the document at a newer version.
+const VERSION_CONFLICT: u64 = 409;
 
 /// What a bulk write did, item by item.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -51,6 +54,12 @@ pub struct BulkOutcome {
     /// retrying them fails the same way until the document or mapping
     /// changes.
     pub rejected: usize,
+    /// How many of those the index already held at this version or a newer
+    /// one (HTTP 409). A request applied after its batch ended has no one
+    /// reading its response, and a live batch holds its events' partitions,
+    /// so it is their newest writer: its conflict means the version source
+    /// went back or repeated, and its newer state must stay queued.
+    pub conflicts: usize,
     /// Whether OpenSearch throttled the request or any item (HTTP 429).
     pub throttled: bool,
     /// The first failure's error type: a fixed description, never content.
@@ -195,6 +204,11 @@ impl SearchIndex {
     /// the alias, so a missing index fails the write instead of being created
     /// with a dynamic mapping.
     ///
+    /// Every item carries `version` as an external version, so the cluster
+    /// keeps the newest state of each document: a request it applies after
+    /// its writer gave up cannot undo a later write. An item the index
+    /// already holds at this version or a newer one fails as a conflict.
+    ///
     /// A throttled request (HTTP 429) comes back as an outcome in which every
     /// item failed; any other failed request is an error.
     pub async fn write(
@@ -202,6 +216,7 @@ impl SearchIndex {
         community: CommunityId,
         documents: &[SearchDocument],
         removed: &[[u8; 32]],
+        version: i64,
     ) -> Result<BulkOutcome, SearchError> {
         if documents.is_empty() && removed.is_empty() {
             return Ok(BulkOutcome::default());
@@ -214,6 +229,8 @@ impl SearchIndex {
                 BulkOperation::index(document_source(community, document))
                     .id(document_id(community, &document.event_id))
                     .index(index)
+                    .version(version)
+                    .version_type(VersionType::External)
                     .into(),
             );
         }
@@ -221,6 +238,8 @@ impl SearchIndex {
             operations.push(
                 BulkOperation::delete(document_id(community, event_id))
                     .index(index)
+                    .version(version)
+                    .version_type(VersionType::External)
                     .into(),
             );
         }
@@ -242,6 +261,7 @@ impl SearchIndex {
             return Ok(BulkOutcome {
                 failed: events,
                 rejected: 0,
+                conflicts: 0,
                 throttled: true,
                 reason: Some(format!("HTTP {THROTTLED}")),
             });
@@ -265,6 +285,9 @@ impl SearchIndex {
                 continue;
             }
             let status = result["status"].as_u64().unwrap_or(0);
+            if status == VERSION_CONFLICT {
+                outcome.conflicts += 1;
+            }
             outcome.throttled |= status == u64::from(THROTTLED);
             if rejects(status) {
                 outcome.rejected += 1;
