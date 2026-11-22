@@ -82,15 +82,20 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 ///
 /// Process-wide because the outbox follows every event insert path. Call it
 /// once at startup, before serving writes, when a search index is configured.
-/// Fails, leaving the outbox off, if migrations have not created the table:
-/// enabled without it, every searchable insert would fail.
+/// Fails, leaving the outbox off, if migrations have not created the table
+/// and the version sequence: enabled without the table, every searchable
+/// insert would fail, and without the sequence, every batch.
 pub async fn enable(pool: &PgPool) -> Result<()> {
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass('public.search_outbox') IS NOT NULL")
-        .fetch_one(pool)
-        .await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.search_outbox') IS NOT NULL \
+                AND to_regclass('public.search_index_version') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
     if !exists {
         return Err(crate::DbError::InvalidData(
-            "the search_outbox table is missing; run migrations before enabling search indexing"
+            "the search_outbox table or search_index_version sequence is missing; \
+             run migrations before enabling search indexing"
                 .into(),
         ));
     }
@@ -243,10 +248,12 @@ pub struct SearchOutboxBatch {
     /// Queued events that are gone, deleted or not searchable: their
     /// documents must be removed from the index.
     pub removed: Vec<[u8; 32]>,
-    /// The database clock in microseconds, read while the batch holds its
-    /// partitions. A later batch of the same event can only be claimed once
-    /// this one ends, so it reads a later state and a larger version: the
-    /// index can keep the newest write by this external version.
+    /// The next value of the `search_index_version` sequence, read while
+    /// the batch holds its partitions. A later batch of the same event can
+    /// only be claimed once this one ends, so it reads a later state and,
+    /// since the sequence never goes back, a larger version: the index keeps
+    /// the newest write by this external version, even when an older batch's
+    /// request lands after it.
     pub version: i64,
 }
 
@@ -408,10 +415,9 @@ pub async fn claim_batch_share(
             queued.insert(event, row.try_get("event_created_at")?);
         }
         let documents = read_documents(&mut tx, &queued).await?;
-        let version: i64 =
-            sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
-                .fetch_one(tx.conn())
-                .await?;
+        let version: i64 = sqlx::query_scalar("SELECT nextval('search_index_version')")
+            .fetch_one(tx.conn())
+            .await?;
         for document in &documents {
             queued.remove(&document.event_id);
         }

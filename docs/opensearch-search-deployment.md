@@ -41,14 +41,20 @@ run on Postgres full-text search; the index is built ahead of switching reads.
   community for the pass, so a community with a full batch of them is stuck
   until they are fixed: watch `buzz_search_index_rejected_total`. Throttling (HTTP 429, which Serverless returns while
   it scales) backs off the same way without counting as a failure.
-- Every item is written with an external version read from the database
-  clock while the batch holds its partitions, so a bulk request the cluster
-  applies late (after a timeout or a crash) cannot undo a newer write. A
-  delete's version is kept for the index's `gc_deletes` (60 seconds by
-  default). If the database clock steps back, items whose document holds a
-  newer version fail with a conflict and keep their rows queued until the
-  clock passes it: watch `buzz_search_index_version_conflicts_total`, which
-  should stay at zero.
+- Every item is written with an external version: the next value of the
+  `search_index_version` sequence, read while the batch holds its
+  partitions. A later batch of the same message reads a later state and,
+  since the sequence never goes back on one primary, a larger version, so
+  a bulk request the cluster applies late (after a timeout or a crash)
+  cannot undo a newer write. The sequence starts above the clock-based
+  versions earlier builds wrote. A delete's version is kept for the index's
+  `gc_deletes` (60 seconds by default). Promoting an asynchronous replica
+  that had not seen the latest values can hand some of them out again:
+  items whose document holds a version from before the failover then fail
+  with a conflict and keep their rows queued, and each retry draws a new
+  value, so they index once the sequence passes it. That shows up as
+  queued rows and `buzz_search_index_version_conflicts_total`, not as lost
+  writes; the counter should otherwise stay at zero.
 - The lease holder also backfills messages stored before the outbox was on.
   For each community it queues the keys of searchable messages in batches
   of 500, newest first, and records how far it got in `search_backfill`
@@ -85,13 +91,13 @@ run on Postgres full-text search; the index is built ahead of switching reads.
 
 1. Deploy a release that knows the `search_outbox` and `search_backfill`
    tables as pending deletion-scoped tables, before the release with
-   migrations `0106` and `0107`. That keeps community deletion working in a
+   migrations `0106` to `0108`. That keeps community deletion working in a
    mixed fleet and after a rollback.
 2. Deploy the release with the migrations. Without `BUZZ_OPENSEARCH_URL`
    nothing is queued and nothing changes.
 3. Set `BUZZ_OPENSEARCH_URL` on every relay instance. Each instance queues
    only the messages it admits itself, so an instance without the setting
-   leaves gaps. Startup fails if migration `0106` has not run. The backfill
+   leaves gaps. Startup fails if migrations `0106` and `0108` have not run. The backfill
    starts as soon as the first instance holds the lease and covers every
    message stored before that. If instances without the setting admitted
    messages after it started, run `DELETE FROM search_backfill` once the
@@ -110,7 +116,7 @@ short-lived queue entries and progress markers, not data.
 | `buzz_search_backfill_complete` | `community` | 1 once the community's backfill is complete. |
 | `buzz_search_indexed_documents_total` | `community`, `op` (`write`, `remove`) | Documents the indexer wrote or removed. Its rate is the indexing rate. |
 | `buzz_search_index_rejected_total` | `community` | Bulk items the cluster refused for good. Their rows stay queued; a steady rate needs a look at the documents or mapping. |
-| `buzz_search_index_version_conflicts_total` | `community` | Bulk items refused because the index held a newer version, which means the database clock went back. Their rows stay queued until the clock passes that version. Should stay at zero. |
+| `buzz_search_index_version_conflicts_total` | `community` | Bulk items refused because the index held a newer version, which means the version sequence handed out values again, as after promoting an asynchronous replica. Their rows stay queued until the sequence passes that version. Should stay at zero. |
 | `buzz_search_indexer_throttled_total` | | Passes the cluster throttled. |
 
 Each drain pass that indexed anything ends with an info log,

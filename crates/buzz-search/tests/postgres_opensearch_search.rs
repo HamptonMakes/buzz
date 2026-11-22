@@ -1075,12 +1075,59 @@ async fn late_community(db: &Db) -> (CommunityId, Keys, Uuid) {
     (community, keys, channel)
 }
 
-/// The database clock in microseconds, as a batch reads its version.
-async fn database_clock(db: &Db) -> i64 {
-    sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+/// The next value of the version sequence batches read.
+async fn next_version(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT nextval('search_index_version')")
         .fetch_one(db.pool())
         .await
-        .expect("database clock")
+        .expect("next version")
+}
+
+/// A database layer whose connections read `clock_timestamp()` ahead by
+/// the microseconds [`set_clock_skew`] last set, through a function on
+/// their own search path. Nothing else on these connections changes.
+async fn skewed_clock_db() -> Db {
+    let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| search_suite::TEST_DB_URL.into());
+    let setup = Db::new(&DbConfig {
+        database_url: url.clone(),
+        ..DbConfig::default()
+    })
+    .await
+    .expect("connect database layer");
+    for statement in [
+        "CREATE SCHEMA IF NOT EXISTS buzz_test_clock",
+        "CREATE TABLE IF NOT EXISTS buzz_test_clock.skew (micros BIGINT NOT NULL)",
+        "CREATE OR REPLACE FUNCTION buzz_test_clock.clock_timestamp() RETURNS timestamptz \
+         LANGUAGE sql AS $$ SELECT pg_catalog.clock_timestamp() + make_interval(secs => \
+         (SELECT coalesce(max(micros), 0) FROM buzz_test_clock.skew) / 1000000.0) $$",
+    ] {
+        sqlx::query(statement)
+            .execute(setup.pool())
+            .await
+            .expect("install the skewed clock");
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Db::new(&DbConfig {
+        database_url: format!(
+            "{url}{separator}options=-c%20search_path%3Dbuzz_test_clock%2Cpg_catalog%2Cpublic"
+        ),
+        ..DbConfig::default()
+    })
+    .await
+    .expect("connect skewed database layer")
+}
+
+/// Run every `clock_timestamp()` of a [`skewed_clock_db`] `micros` ahead.
+async fn set_clock_skew(db: &Db, micros: i64) {
+    sqlx::query(
+        "WITH cleared AS (DELETE FROM buzz_test_clock.skew) \
+         INSERT INTO buzz_test_clock.skew (micros) VALUES ($1)",
+    )
+    .bind(micros)
+    .execute(db.pool())
+    .await
+    .expect("set the clock skew");
 }
 
 /// The index keeps each document's newest version: a bulk request the
@@ -1130,9 +1177,11 @@ async fn a_late_write_cannot_undo_a_newer_one() {
 }
 
 /// A live batch is its events' newest writer, so a conflict it meets means
-/// the database clock went back: here the document was written while the
-/// clock ran ahead. The newer state stays queued and the pass fails, and
-/// once the clock passes the version the index holds, it is written.
+/// the version sequence handed out a value again, as after promoting an
+/// asynchronous replica that had not replayed it: here the document was
+/// written at a version the sequence has not reached. The newer state stays
+/// queued and the pass fails, and once the sequence passes the version the
+/// index holds, it is written.
 /// Mutation: count a version conflict as written → RED.
 #[tokio::test]
 #[ignore = "requires Postgres and OpenSearch"]
@@ -1144,7 +1193,7 @@ async fn a_newer_state_below_the_held_version_stays_queued() {
     db.insert_event(community, &original, Some(channel))
         .await
         .expect("insert");
-    let ahead = database_clock(&db).await + 2_000_000;
+    let ahead = next_version(&db).await + 1_000;
     let outcome = index
         .write(
             community,
@@ -1174,11 +1223,11 @@ async fn a_newer_state_below_the_held_version_stays_queued() {
     index.refresh().await.expect("refresh");
     assert!(find(&service, community, "secondword").await.is_empty());
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while database_clock(&db).await <= ahead {
-        assert!(tokio::time::Instant::now() < deadline, "the clock stalled");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    sqlx::query("SELECT setval('search_index_version', $1)")
+        .bind(ahead)
+        .execute(db.pool())
+        .await
+        .expect("move the sequence to the held version");
     drain(&indexer, &index).await;
     assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
     assert!(find(&service, community, "firstword").await.is_empty());
@@ -1186,6 +1235,87 @@ async fn a_newer_state_below_the_held_version_stays_queued() {
         find(&service, community, "secondword").await,
         vec![original.id.to_bytes()]
     );
+    index.delete().await.expect("delete index");
+}
+
+/// A batch's request can land after the batch has ended and a later batch
+/// has written a newer state, as when its indexer timed out with the
+/// request in flight. The later batch's version must be the larger one even
+/// when the database clock stepped back in between; otherwise the late
+/// request wins, the index keeps the older text, and no live batch ever
+/// meets a conflict. Here the clock runs 10 s ahead for the first batch and
+/// is put back before the second.
+/// Mutation: read the version from `clock_timestamp()` → RED.
+#[tokio::test]
+#[ignore = "requires Postgres and OpenSearch"]
+async fn a_late_request_from_before_a_clock_step_changes_nothing() {
+    let db = sync_db().await;
+    let (index, _prefix) = sync_index().await;
+    let skewed = skewed_clock_db().await;
+    let (community, keys, channel) = late_community(&db).await;
+    let original = channel_message(&keys, channel, 9, "firstword", &[], 0);
+    db.insert_event(community, &original, Some(channel))
+        .await
+        .expect("insert");
+
+    // The first batch reads the original while the clock runs ahead; it
+    // sends its request and ends without completing, so the request is in
+    // flight and the row stays queued.
+    set_clock_skew(&db, 10_000_000).await;
+    let mut skip = Vec::new();
+    let (documents, removed, version) = loop {
+        let batch = search_outbox::claim_batch(skewed.pool(), 100, &skip)
+            .await
+            .expect("claim")
+            .expect("a batch of the community");
+        if batch.community() == community {
+            break (
+                batch.documents.clone(),
+                batch.removed.clone(),
+                batch.version,
+            );
+        }
+        skip.push(batch.community());
+    };
+    assert_eq!(
+        documents,
+        vec![document_of(&original, channel, "firstword")]
+    );
+
+    // The clock steps back, the message is edited, and the next batch
+    // writes the edit.
+    set_clock_skew(&db, 0).await;
+    let edit = channel_message(
+        &keys,
+        channel,
+        40003,
+        "secondword",
+        &[&["e", &original.id.to_hex()]],
+        1,
+    );
+    db.insert_event(community, &edit, Some(channel))
+        .await
+        .expect("insert edit");
+    let indexer = Indexer::new(skewed.clone(), index.clone());
+    drain(&indexer, &index).await;
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+
+    // The first batch's request lands now.
+    let outcome = index
+        .write(community, &documents, &removed, version)
+        .await
+        .expect("late write");
+    index.refresh().await.expect("refresh");
+    let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
+    assert!(
+        find(&service, community, "firstword").await.is_empty(),
+        "the late request put the original text back: {outcome:?}"
+    );
+    assert_eq!(
+        find(&service, community, "secondword").await,
+        vec![original.id.to_bytes()]
+    );
+    assert_eq!(outcome.conflicts, 1, "{outcome:?}");
     index.delete().await.expect("delete index");
 }
 
