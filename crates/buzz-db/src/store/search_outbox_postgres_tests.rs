@@ -235,12 +235,20 @@ async fn disabled_outbox_queues_nothing() {
     assert_eq!(queued(pool, community).await, 0);
 }
 
-/// Enabling fails, and leaves admission unchanged, while the table is missing.
+/// Enabling fails, and leaves admission unchanged, while the version
+/// sequence or the table is missing.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn enable_requires_the_table() {
     let db = connect().await;
     let pool = db.pool();
+    sqlx::query("DROP SEQUENCE search_index_version")
+        .execute(pool)
+        .await
+        .expect("drop sequence");
+    search_outbox::enable(pool)
+        .await
+        .expect_err("enable refuses a database without the version sequence");
     sqlx::query("DROP TABLE search_outbox")
         .execute(pool)
         .await
