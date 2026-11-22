@@ -1,7 +1,11 @@
 -- The external version the search indexer writes with each batch (see
--- crates/buzz-db/src/store/search_outbox.rs). A sequence never hands out a
--- smaller value than one it already handed out on the same primary, so a
--- batch's version is larger than that of every batch before it. It starts
--- above the database clock in microseconds, which earlier versions used, so
--- an index written with those keeps accepting writes.
+-- crates/buzz-db/src/store/search_outbox.rs). While a primary runs, a
+-- sequence never hands out a value twice, so a batch's version is larger
+-- than that of every batch before it. It can repeat values after a crash,
+-- since a value read by a transaction that has not committed is not yet
+-- durable, and after promoting an asynchronous replica; see
+-- docs/opensearch-search-deployment.md for what that does to the index.
+-- OpenSearch accepts an external version only above the one a document
+-- holds, and documents written without one hold small internal versions
+-- (one per write), so the sequence starts far above them.
 CREATE SEQUENCE search_index_version AS BIGINT START WITH 10000000000000000;
