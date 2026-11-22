@@ -1238,8 +1238,8 @@ async fn a_late_write_cannot_undo_a_newer_one() {
 }
 
 /// A live batch is its events' newest writer, so a conflict it meets means
-/// the version sequence handed out a value again, as after promoting an
-/// asynchronous replica that had not replayed it: here the document was
+/// the version sequence handed out a value again, as after a Postgres crash
+/// or promoting an asynchronous replica: here the document was
 /// written at a version the sequence has not reached. The newer state stays
 /// queued and the pass fails, and once the sequence passes the version the
 /// index holds, it is written.

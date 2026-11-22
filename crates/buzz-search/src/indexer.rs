@@ -317,8 +317,8 @@ impl Indexer {
             if outcome.conflicts > 0 {
                 // This batch is its events' newest writer, so the index can
                 // hold a newer version only if the version sequence handed
-                // out a value again, as after promoting an asynchronous
-                // replica. Keep the rows: the retry carries a later version
+                // out a value again, as after a Postgres crash or promoting
+                // an asynchronous replica. Keep the rows: the retry carries a later version
                 // once the sequence passes the one held.
                 error!(%community, items = outcome.conflicts, "search index holds a newer version than the batch writing it; the version sequence went back; its rows stay queued");
                 metrics::counter!("buzz_search_index_version_conflicts_total", "community" => label)

@@ -47,18 +47,21 @@ shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-se
   cluster is healthy again.
 - Every item is written with an external version: the next value of the
   `search_index_version` sequence, read while the batch holds its
-  partitions. A later batch of the same message reads a later state and,
-  since the sequence never goes back on one primary, a larger version, so
-  a bulk request the cluster applies late (after a timeout or a crash)
-  cannot undo a newer write. The sequence starts above the clock-based
-  versions earlier builds wrote. A delete's version is kept for the index's
-  `gc_deletes` (60 seconds by default). Promoting an asynchronous replica
-  that had not seen the latest values can hand some of them out again:
-  items whose document holds a version from before the failover then fail
-  with a conflict and keep their rows queued, and each retry draws a new
-  value, so they index once the sequence passes it. That shows up as
-  queued rows and `buzz_search_index_version_conflicts_total`, not as lost
-  writes; the counter should otherwise stay at zero.
+  partitions. A later batch of the same message reads a later state and a
+  larger value, so a bulk request the cluster applies late (after a timeout
+  or a crash) cannot undo a newer write. OpenSearch accepts an external
+  version only above the one a document holds, and documents written
+  without versions hold small internal ones, so the sequence starts far
+  above them. A delete's version is kept for the index's `gc_deletes` (60
+  seconds by default). The sequence can hand out values again after a
+  Postgres crash (a batch sends its request before it commits, and an
+  uncommitted `nextval` is not durable) or after promoting an asynchronous
+  replica. A batch that then meets a newer version keeps its rows queued
+  until the sequence passes it, counted in
+  `buzz_search_index_version_conflicts_total`. A write is lost only if, as
+  well, a request sent before the crash or failover lands after a newer
+  write of the same message: searches then match its stale text, but every
+  hit is re-read from Postgres, so stale or deleted text is never shown.
 - The lease holder also backfills messages stored before the outbox was on.
   For each community it queues the keys of searchable messages in batches
   of 500, newest first, and records how far it got in `search_backfill`
@@ -133,7 +136,7 @@ short-lived queue entries and progress markers, not data.
 | `buzz_search_backfill_complete` | `community` | 1 once the community's backfill is complete. |
 | `buzz_search_indexed_documents_total` | `community`, `op` (`write`, `remove`) | Documents the indexer wrote or removed. Its rate is the indexing rate. |
 | `buzz_search_index_rejected_total` | `community` | Bulk items the cluster refused for good. Their rows stay queued; a steady rate needs a look at the documents or mapping. |
-| `buzz_search_index_version_conflicts_total` | `community` | Bulk items refused because the index held a newer version, which means the version sequence handed out values again, as after promoting an asynchronous replica. Their rows stay queued until the sequence passes that version. Should stay at zero. |
+| `buzz_search_index_version_conflicts_total` | `community` | Bulk items refused because the index held a newer version, which means the version sequence handed out values again, as after a Postgres crash or promoting an asynchronous replica. Their rows stay queued until the sequence passes that version. Should stay at zero. |
 | `buzz_search_indexer_throttled_total` | | Passes the cluster throttled. |
 
 Each drain pass that indexed anything ends with an info log,
