@@ -551,10 +551,12 @@ async fn an_edited_message_matches_its_current_text() {
 
 /// Account deletion scrubs a message another person replied to and erases
 /// the rest; neither matches its text afterwards, and the reply still does.
+/// It runs as `buzz-admin user-deletions` does, without the outbox enabled:
+/// the messages reach the index through the backfill.
 #[tokio::test]
 #[ignore = "requires Postgres and OpenSearch"]
 async fn scrubbed_and_erased_messages_no_longer_match() {
-    let db = sync_db().await;
+    let db = unsynced_db().await;
     let (index, _) = sync_index().await;
     let community = search_suite::mk_community(db.pool(), "scrub.example").await;
     let leaving = Keys::generate();
@@ -564,7 +566,7 @@ async fn scrubbed_and_erased_messages_no_longer_match() {
         .await
         .expect("ensure user");
     let service = SearchService::with_opensearch(db.pool().clone(), index.clone());
-    let indexer = tokio::spawn(Indexer::new(db.clone(), index.clone()).run());
+    let indexer = Indexer::new(db.clone(), index.clone());
 
     let root = channel_message(&leaving, channel, 9, "scrubword referenced", &[], -2);
     let erased = channel_message(&leaving, channel, 9, "scrubword alone", &[], -1);
@@ -603,7 +605,9 @@ async fn scrubbed_and_erased_messages_no_longer_match() {
     )
     .await
     .expect("insert reply");
-    wait_until_indexed(&db, &index).await;
+    assert_eq!(search_outbox::depth(db.pool()).await.expect("depth"), 0);
+    indexer.backfill().await.expect("backfill");
+    drain(&indexer, &index).await;
     assert_eq!(find(&service, community, "scrubword").await.len(), 2);
 
     let summary = db
@@ -626,14 +630,13 @@ async fn scrubbed_and_erased_messages_no_longer_match() {
         summary.scrubbed_events, 1,
         "the replied-to root is scrubbed"
     );
-    wait_until_indexed(&db, &index).await;
+    drain(&indexer, &index).await;
     assert!(find(&service, community, "scrubword").await.is_empty());
     assert_eq!(
         find(&service, community, "replyword").await,
         vec![*reply.id.as_bytes()]
     );
 
-    indexer.abort();
     index.delete().await.expect("delete index");
 }
 
