@@ -24,16 +24,18 @@
 //! - `BUZZ_TEST_CONSISTENCY_OPS`: operations per writer; default 20;
 //! - `BUZZ_TEST_CONSISTENCY_LATE_APPLY`: `1` lets a request stalled when its
 //!   indexer crashes reach the cluster afterwards, as a bulk request the
-//!   cluster is still working through when its client times out would.
-//! - `BUZZ_TEST_CONSISTENCY_CLOCK_BACK`: `1` moves the versions the indexer
-//!   writes as if the database clock jumped 0.3-3 s ahead for a stretch of
-//!   indexing and was then corrected, stepping back.
+//!   cluster is still working through when its client times out would. The
+//!   request waits until a later request has written one of its documents,
+//!   or at most 0-1.5 s, so it lands after the newer write;
+//! - `BUZZ_TEST_CONSISTENCY_SEQUENCE_BACK`: `1` sets the version sequence
+//!   back by 1-50 values now and then, as promoting an asynchronous replica
+//!   that had not seen the latest values would.
 
 #[allow(unused_macros, unused_imports)]
 mod search_suite;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,9 +87,8 @@ struct Faults {
     lost_response: u32,
     stall: u32,
     late_apply: bool,
-    /// Whether the driver moves the version source: it jumps forward for
-    /// a stretch, then steps back.
-    clock_back: bool,
+    /// Whether the driver sets the version sequence back now and then.
+    sequence_back: bool,
 }
 
 struct ProxyState {
@@ -101,10 +102,17 @@ struct ProxyState {
     pending: AtomicUsize,
     /// Requests forwarded after their client had gone.
     late_applied: AtomicUsize,
+    /// Of those, the ones forwarded after a later request wrote one of
+    /// their documents.
+    late_after_newer: AtomicUsize,
     bulks: AtomicUsize,
-    /// Microseconds added to every external version in a bulk request, as
-    /// if the database clock the versions are read from were off by that.
-    skew: AtomicI64,
+    /// For each document id, the number of the last bulk request the
+    /// cluster accepted a write of it from.
+    written: Mutex<BTreeMap<String, u64>>,
+    /// Bulk requests the cluster has answered, counting from 1.
+    answered: AtomicU64,
+    /// Wakes requests waiting in `written`.
+    write_seen: tokio::sync::Notify,
 }
 
 struct Proxy {
@@ -125,8 +133,11 @@ impl Proxy {
             crash,
             pending: AtomicUsize::new(0),
             late_applied: AtomicUsize::new(0),
+            late_after_newer: AtomicUsize::new(0),
             bulks: AtomicUsize::new(0),
-            skew: AtomicI64::new(0),
+            written: Mutex::new(BTreeMap::new()),
+            answered: AtomicU64::new(0),
+            write_seen: tokio::sync::Notify::new(),
         });
         let app = axum::Router::new()
             .fallback(proxy_request)
@@ -154,7 +165,6 @@ impl Proxy {
         *self.state.faults.lock().expect("faults") = faults;
         if faults.is_none() {
             *self.state.outage_until.lock().expect("outage") = None;
-            self.state.skew.store(0, Ordering::SeqCst);
         }
     }
 
@@ -200,34 +210,59 @@ async fn forward(
     let status = response.status().as_u16();
     let content_type = response.headers().get("content-type").cloned();
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    if status == 200
+        && path
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/_bulk"))
+    {
+        record_writes(state, &bytes);
+    }
     Ok((status, content_type, bytes))
 }
 
-/// `body` with `skew` added to the external version of every action.
-fn skewed(body: &[u8], skew: i64) -> axum::body::Bytes {
-    let text = std::str::from_utf8(body).expect("utf-8 bulk body");
-    let mut out = String::with_capacity(text.len() + 64);
-    for line in text.lines() {
-        let mut value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
-        let version = ["index", "delete"]
-            .iter()
-            .find_map(|key| value.get(*key))
-            .filter(|_| value.as_object().is_some_and(|object| object.len() == 1))
-            .and_then(|action| action["version"].as_i64());
-        match version {
-            Some(version) => {
-                for key in ["index", "delete"] {
-                    if let Some(action) = value.get_mut(key) {
-                        action["version"] = json!(version + skew);
-                    }
-                }
-                out.push_str(&value.to_string());
-            }
-            None => out.push_str(line),
+/// Note the documents a bulk response says the cluster wrote.
+fn record_writes(state: &ProxyState, response: &[u8]) {
+    let Ok(response) = serde_json::from_slice::<Value>(response) else {
+        return;
+    };
+    let number = state.answered.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut written = state.written.lock().expect("written");
+    for item in response["items"].as_array().into_iter().flatten() {
+        let Some(result) = item.as_object().and_then(|item| item.values().next()) else {
+            continue;
+        };
+        let accepted = result["status"].as_u64().is_some_and(|status| status < 300);
+        if let (true, Some(id)) = (accepted, result["_id"].as_str()) {
+            written.insert(id.to_string(), number);
         }
-        out.push('\n');
     }
-    axum::body::Bytes::from(out)
+    drop(written);
+    state.write_seen.notify_waiters();
+}
+
+/// Wait until a bulk request answered after this call writes one of `ids`,
+/// for at most `bound`. Whether one did.
+async fn newer_write(state: &ProxyState, ids: &[String], bound: Duration) -> bool {
+    let since = state.answered.load(Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        let seen = state.write_seen.notified();
+        tokio::pin!(seen);
+        seen.as_mut().enable();
+        {
+            let written = state.written.lock().expect("written");
+            if ids
+                .iter()
+                .any(|id| written.get(id).is_some_and(|number| *number > since))
+            {
+                return true;
+            }
+        }
+        if tokio::time::timeout_at(deadline, seen).await.is_err() {
+            return false;
+        }
+    }
 }
 
 /// The item actions of an NDJSON bulk body: each action line and, for an
@@ -263,12 +298,6 @@ async fn proxy_request(
     let content_type = parts.headers.get("content-type").cloned();
     let faults = *state.faults.lock().expect("faults");
     let bulk = parts.uri.path().ends_with("/_bulk");
-    let skew = state.skew.load(Ordering::SeqCst);
-    let body = if bulk && skew != 0 {
-        skewed(&body, skew)
-    } else {
-        body
-    };
     let Some(faults) = faults.filter(|_| bulk) else {
         return match forward(&state, parts.method, &path, content_type, body).await {
             Ok((status, content_type, bytes)) => {
@@ -414,8 +443,9 @@ async fn partial_failure(
 
 /// Hold the request for `stall_ms`, then forward it. If its indexer
 /// crashes meanwhile, the client gets an error and the request reaches the
-/// cluster `late_ms` later only with `late_apply`; otherwise never. A
-/// detached task owns the request, so it outlives a client that hangs up.
+/// cluster only with `late_apply`, otherwise never: once a later request
+/// has written one of its documents, or after `late_ms`. A detached task
+/// owns the request, so it outlives a client that hangs up.
 #[allow(clippy::too_many_arguments)]
 async fn stall(
     state: Arc<ProxyState>,
@@ -440,9 +470,21 @@ async fn stall(
         if orphaned || respond.is_closed() {
             let _ = respond.send(reply(502, json!({ "error": "injected crash" })));
             if late_apply {
-                tokio::time::sleep(Duration::from_millis(late_ms)).await;
+                let ids: Vec<String> = bulk_items(&body)
+                    .iter()
+                    .filter_map(|(action, _)| {
+                        ["index", "delete"]
+                            .iter()
+                            .find_map(|op| action[*op]["_id"].as_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                let after_newer = newer_write(&state, &ids, Duration::from_millis(late_ms)).await;
                 let _ = forward(&state, method, &path, content_type, body).await;
                 state.late_applied.fetch_add(1, Ordering::SeqCst);
+                if after_newer {
+                    state.late_after_newer.fetch_add(1, Ordering::SeqCst);
+                }
             }
         } else {
             let response = match forward(&state, method, &path, content_type, body).await {
@@ -1015,7 +1057,7 @@ fn plan(seed: u64, rng: &mut StdRng) -> Plan {
             lost_response: rng.random_range(0..8),
             stall: rng.random_range(0..20),
             late_apply: env_or("BUZZ_TEST_CONSISTENCY_LATE_APPLY", "0") == "1",
-            clock_back: env_or("BUZZ_TEST_CONSISTENCY_CLOCK_BACK", "0") == "1",
+            sequence_back: env_or("BUZZ_TEST_CONSISTENCY_SEQUENCE_BACK", "0") == "1",
         },
     }
 }
@@ -1026,30 +1068,32 @@ async fn bounded_drain(indexer: &Indexer) {
 }
 
 /// Index concurrently with the writers until `done`, injecting crashes,
-/// overlapping indexers, outages and, with `clock_back`, clock jumps.
+/// overlapping indexers, outages and, with `sequence_back`, sequence
+/// rewinds.
 async fn driver(
+    db: Db,
     first: Indexer,
     second: Indexer,
     proxy: Arc<Proxy>,
     done: Arc<AtomicBool>,
     seed: u64,
-    clock_back: bool,
+    sequence_back: bool,
 ) -> (usize, usize, usize, usize) {
     let mut rng = StdRng::seed_from_u64(seed ^ 0xd21_7e5);
-    let (mut crashes, mut overlaps, mut outages, mut jumps) = (0, 0, 0, 0);
+    let (mut crashes, mut overlaps, mut outages, mut rewinds) = (0, 0, 0, 0);
     while !done.load(Ordering::SeqCst) {
-        if clock_back && rng.random_bool(0.15) {
-            // The clock jumps 0.3-3 s ahead for a stretch of indexing,
-            // then is corrected: it steps back.
-            proxy
-                .state
-                .skew
-                .store(rng.random_range(300_000..3_000_000), Ordering::SeqCst);
-            bounded_drain(&first).await;
-            tokio::time::sleep(Duration::from_millis(rng.random_range(0..200))).await;
-            proxy.state.skew.store(0, Ordering::SeqCst);
-            jumps += 1;
-            continue;
+        if sequence_back && rng.random_bool(0.15) {
+            // A failover to a replica that had not seen the last values:
+            // the sequence hands some of them out again.
+            sqlx::query(
+                "SELECT setval('search_index_version', \
+                 greatest(last_value - $1, 1)) FROM search_index_version",
+            )
+            .bind(rng.random_range(1..=50i64))
+            .execute(db.pool())
+            .await
+            .expect("set the version sequence back");
+            rewinds += 1;
         }
         match rng.random_range(0..100u32) {
             0..=44 => bounded_drain(&first).await,
@@ -1080,7 +1124,7 @@ async fn driver(
         }
         tokio::time::sleep(Duration::from_millis(rng.random_range(0..20))).await;
     }
-    (crashes, overlaps, outages, jumps)
+    (crashes, overlaps, outages, rewinds)
 }
 
 /// What one community's document should hold, read from Postgres.
@@ -1347,7 +1391,8 @@ struct RunReport {
     overlaps: usize,
     outages: usize,
     late_applied: usize,
-    jumps: usize,
+    late_after_newer: usize,
+    rewinds: usize,
 }
 
 async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
@@ -1387,12 +1432,13 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
         })
     };
     let driving = tokio::spawn(driver(
+        db.clone(),
         first.clone(),
         second,
         proxy.clone(),
         done.clone(),
         seed,
-        plan.faults.clock_back,
+        plan.faults.sequence_back,
     ));
     let writers: Vec<_> = (0..world.authors.len())
         .map(|author| {
@@ -1410,11 +1456,11 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
     }
     done.store(true, Ordering::SeqCst);
     backfill.await.expect("backfill task");
-    let (crashes, overlaps, outages, jumps) = driving.await.expect("driver");
+    let (crashes, overlaps, outages, rewinds) = driving.await.expect("driver");
 
     // Let everything drain with the faults off. A pass can still fail
-    // while documents hold versions from a clock that jumped ahead; their
-    // rows stay queued until the clock passes them.
+    // while documents hold versions the sequence handed out again; their
+    // rows stay queued until the sequence passes them.
     proxy.set_faults(None);
     let mut last_error = None;
     let drained = tokio::time::timeout(Duration::from_secs(120), async {
@@ -1455,7 +1501,8 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
         overlaps,
         outages,
         late_applied: proxy.state.late_applied.load(Ordering::SeqCst),
-        jumps,
+        late_after_newer: proxy.state.late_after_newer.load(Ordering::SeqCst),
+        rewinds,
     };
     if violations.is_empty() {
         direct.delete().await.expect("delete index");
@@ -1464,8 +1511,8 @@ async fn run(db: &Db, seed: u64, ops: usize) -> Result<RunReport, Vec<String>> {
         violations.insert(
             0,
             format!(
-                "seed {seed}: {plan:?}, index prefix {prefix} kept, {} messages, {} bulks, {crashes} crashes, {overlaps} overlaps, {outages} outages, {} late, {jumps} clock jumps",
-                report.messages, report.bulks, report.late_applied
+                "seed {seed}: {plan:?}, index prefix {prefix} kept, {} messages, {} bulks, {crashes} crashes, {overlaps} overlaps, {outages} outages, {} late ({} after a newer write), {rewinds} sequence rewinds",
+                report.messages, report.bulks, report.late_applied, report.late_after_newer
             ),
         );
         Err(violations)
@@ -1487,7 +1534,7 @@ async fn the_index_converges_on_postgres_under_interleaving() {
         let started = Instant::now();
         match tokio::time::timeout(Duration::from_secs(300), run(&db, seed, ops)).await {
             Ok(Ok(report)) => eprintln!(
-                "seed {seed}: ok in {:?}: {} messages, {} bulks, {} crashes, {} overlaps, {} outages, {} late, {} clock jumps",
+                "seed {seed}: ok in {:?}: {} messages, {} bulks, {} crashes, {} overlaps, {} outages, {} late ({} after a newer write), {} sequence rewinds",
                 started.elapsed(),
                 report.messages,
                 report.bulks,
@@ -1495,7 +1542,8 @@ async fn the_index_converges_on_postgres_under_interleaving() {
                 report.overlaps,
                 report.outages,
                 report.late_applied,
-                report.jumps
+                report.late_after_newer,
+                report.rewinds
             ),
             Ok(Err(violations)) => {
                 eprintln!("seed {seed}: FAILED\n  {}", violations.join("\n  "));

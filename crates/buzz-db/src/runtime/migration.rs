@@ -1029,11 +1029,17 @@ mod postgres_tests {
     }
 
     /// Where `file`, a path under `schema/`, breaks docs/database.md Rules 1,
-    /// 2 and 4: only `tables/public/`, `types/`, `partitions/` and `seeds/`
-    /// hold schema files, and no file declares a trigger, function,
+    /// 2 and 4: only `tables/public/`, `types/`, `sequences/`, `partitions/`
+    /// and `seeds/` hold schema files, and no file declares a trigger, function,
     /// procedure, rule or foreign key.
     fn desired_state_file_violations(file: &str, text: &str) -> Vec<String> {
-        let allowed = ["tables/public/", "types/", "partitions/", "seeds/"];
+        let allowed = [
+            "tables/public/",
+            "types/",
+            "sequences/",
+            "partitions/",
+            "seeds/",
+        ];
         let misplaced = (file != "schema.sql" && !allowed.iter().any(|dir| file.starts_with(dir)))
             .then(|| {
                 format!(
@@ -1056,7 +1062,10 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 107);
+        assert_eq!(migrations.len(), 108);
+        assert_eq!(migrations[107].version, 108);
+        assert!(strip_sql_comments(migrations[107].sql.as_str())
+            .contains("CREATE SEQUENCE search_index_version"));
         assert_eq!(migrations[106].version, 107);
         assert!(strip_sql_comments(migrations[106].sql.as_str())
             .contains("CREATE TABLE search_backfill"));
@@ -2471,6 +2480,11 @@ mod postgres_tests {
             (
                 "types/widget_kind.sql",
                 "CREATE TYPE widget_kind AS ENUM ('a');",
+                0,
+            ),
+            (
+                "sequences/widget_number.sql",
+                "CREATE SEQUENCE widget_number AS BIGINT;",
                 0,
             ),
             ("schema.sql", "\\i tables/public/widgets.sql", 0),
