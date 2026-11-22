@@ -45,11 +45,19 @@ pub struct BackfillStep {
     pub completed: bool,
 }
 
-/// Whether the outbox holds fewer than `bound` rows. Reads at most `bound`
-/// rows, so it stays cheap however large the queue grows.
+/// Whether the outbox holds fewer than `bound` rows the indexer can drain.
+/// Rows of a community fenced for deletion are left out: claims skip them
+/// until the purge removes them, so counting them could hold back every
+/// other community's backfill for as long as the deletion takes. Reads at
+/// most `bound` rows, so it stays cheap however large the queue grows.
 pub async fn outbox_below(pool: &PgPool, bound: i64) -> Result<bool> {
     let depth: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM (SELECT 1 FROM search_outbox LIMIT $1) AS bounded",
+        "SELECT count(*) FROM ( \
+             SELECT 1 FROM search_outbox o \
+             JOIN communities c ON c.id = o.community_id \
+             WHERE c.deletion_state = 'active' AND c.deleted_at IS NULL \
+             LIMIT $1 \
+         ) AS bounded",
     )
     .bind(bound)
     .fetch_one(pool)

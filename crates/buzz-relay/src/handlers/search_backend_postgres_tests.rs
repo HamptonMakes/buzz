@@ -884,3 +884,106 @@ async fn prefix_searches_follow_the_flag() {
     assert_eq!(recorded.requests("opensearch", "primary", "hits"), 1);
     f.delete().await;
 }
+
+/// The index holds only message kinds, so a search that names another kind,
+/// mixes one in, or names no kinds stays on Postgres at 1 and 2, is not
+/// shadowed, and counts as skipped with `unindexed_kinds`. That rule comes
+/// before the mode rule, so a people search (kind 0, in prefix mode as
+/// clients send it) counts there too. A message-kind search at 2 still
+/// reaches the cluster.
+/// Mutation: drop the kind check from routing → RED (the cluster is
+/// contacted and fails the word searches at 2).
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires Postgres and Redis"]
+async fn searches_of_unindexed_kinds_stay_on_postgres() {
+    let recorder = DebuggingRecorder::new();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let mut recorded = Recorded::new(&recorder);
+    let cluster = FakeCluster::start(true).await;
+    let f = Fixture::new(cluster.index.clone(), Duration::from_secs(1)).await;
+    let c = f.community().await;
+    let needle = word("unindexed")[..16].to_owned();
+    let message = f.post(&c, c.private, &needle).await;
+    let profile = EventBuilder::new(Kind::Metadata, json!({ "name": needle }).to_string())
+        .sign_with_keys(&c.owner)
+        .expect("sign");
+    f.state
+        .db
+        .insert_event(c.tenant.community(), &profile, None)
+        .await
+        .expect("store the profile");
+    let query = |kinds: Option<Vec<i32>>, mode: buzz_search::SearchMode| buzz_search::SearchQuery {
+        community: c.tenant.community(),
+        q: match mode {
+            buzz_search::SearchMode::FullText => needle.clone(),
+            buzz_search::SearchMode::Prefix => needle[..12].to_owned(),
+        },
+        channel_scope: buzz_search::ChannelScope::ChannelsOrChannelLess(vec![c.private]),
+        kinds,
+        authors: None,
+        since: None,
+        until: None,
+        page: 1,
+        per_page: 10,
+        mode,
+        sort: buzz_search::SearchSort::Relevance,
+    };
+    let found = |query: buzz_search::SearchQuery| {
+        let search = Arc::clone(&f.state.search);
+        async move {
+            let mut ids: Vec<[u8; 32]> = search
+                .search(&query)
+                .await
+                .expect("Postgres serves")
+                .hits
+                .iter()
+                .map(|hit| hit.event_id)
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let mut both = vec![message.id.to_bytes(), profile.id.to_bytes()];
+    both.sort();
+    let words = buzz_search::SearchMode::FullText;
+    let prefix = buzz_search::SearchMode::Prefix;
+
+    f.set_backend(&c, 2);
+    assert_eq!(
+        found(query(Some(vec![0]), words)).await,
+        vec![profile.id.to_bytes()]
+    );
+    assert_eq!(found(query(Some(vec![9, 0]), words)).await, both);
+    assert_eq!(found(query(None, words)).await, both);
+    assert_eq!(
+        found(query(Some(vec![0]), prefix)).await,
+        vec![profile.id.to_bytes()]
+    );
+    f.set_backend(&c, 1);
+    assert_eq!(found(query(Some(vec![9, 0]), words)).await, both);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(cluster.connections(), 0, "OpenSearch was contacted");
+    recorded.collect();
+    let skipped = |setting: &str, reason: &str| {
+        recorded.counter(
+            "buzz_search_opensearch_skipped_total",
+            &[("setting", setting), ("reason", reason)],
+        )
+    };
+    assert_eq!(
+        (
+            skipped("opensearch", "unindexed_kinds"),
+            skipped("shadow", "unindexed_kinds"),
+            skipped("opensearch", "unsupported_mode"),
+        ),
+        (4, 1, 0)
+    );
+
+    f.set_backend(&c, 2);
+    f.state
+        .search
+        .search(&query(Some(vec![9]), words))
+        .await
+        .expect_err("a message search at 2 goes to the failing cluster");
+}

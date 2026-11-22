@@ -11,7 +11,11 @@ shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-se
   rolled-back write queues nothing, and admission never calls OpenSearch.
   Deletions (NIP-09, NIP-29 and moderation) and account-deletion scrubs queue
   a row for each removed message the same way. A message edit (kind 40003),
-  or a deletion of one, queues the message it edits.
+  or a deletion of one, queues the message it edits. Account deletion
+  (`buzz-admin user-deletions`) needs no OpenSearch setting: it queues
+  whenever `search_outbox` or `search_backfill` holds a row, which is once
+  an indexing relay has run against the database. To stop indexing for
+  good, unset `BUZZ_OPENSEARCH_URL` everywhere, then empty both tables.
 - One relay instance holds the indexer lease (a Postgres session advisory
   lock). Instances that start together spread their lease attempts with
   jitter, and followers check the lease every 2.5 to 5 seconds. The lease
@@ -146,7 +150,10 @@ backend for each community, read on every search:
 Without `BUZZ_OPENSEARCH_URL` the flag is ignored and Postgres serves. Every
 hit is still re-read from Postgres and access-checked at every value.
 Word and prefix-mode searches (the bridge's `search_mode: "prefix"`) follow
-the flag alike.
+the flag alike. The index holds only message kinds, so a search that names
+any other kind (people search names kind `0`) or names no kinds stays on
+Postgres at every value and is not shadowed. Message search names message
+kinds and follows the flag.
 
 The backends differ on edited messages. Postgres matches the text a message
 was stored with and ignores its edits, while the index holds the text of the
@@ -172,7 +179,7 @@ BUZZ_FEATURE_FLAGS_PROVIDER=environment BUZZ_FEATURE_FLAG_SEARCH_BACKEND=1 just 
 | `buzz_search_duration_seconds{backend, role}` | Search latency per backend; `role` is `primary` (served the request) or `shadow`. |
 | `buzz_search_requests_total{backend, role, outcome}` | `outcome`: `hits`, `zero_results` (first page empty), `empty_page` (later page empty), `error` (including failed shards and engine timeouts), `timeout` (shadow deadline). Zero-result rate is `zero_results` over first-page searches. |
 | `buzz_search_shadow_overlap_ratio` | Share of the top 10 hits both backends returned, over the larger list. |
-| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `shadow_busy` when 32 shadow searches were already in flight. |
+| `buzz_search_opensearch_skipped_total{setting, reason}` | Searches that did not use OpenSearch at setting 1 or 2: `shadow_busy` when 32 shadow searches were already in flight, `unindexed_kinds` when the search named a kind the index does not hold, or no kinds. |
 | `buzz_search_outbox_depth` | Queued outbox rows (counted up to 1,000,000), sampled every 15 s. |
 | `buzz_search_index_lag_seconds` | Age of the oldest queued outbox row; `0` when the queue is empty. |
 

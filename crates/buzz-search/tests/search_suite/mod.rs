@@ -108,7 +108,7 @@ impl Searcher<'_> {
     /// [`SearchService::search`], once the backend has caught up.
     pub async fn search(&self, query: &SearchQuery) -> Result<SearchResult, SearchError> {
         self.catch_up().await;
-        self.fixture.service.search(query).await
+        self.fixture.service.search(&self.routed(query)).await
     }
 
     /// [`SearchService::search_scored`], once the backend has caught up.
@@ -117,7 +117,21 @@ impl Searcher<'_> {
         query: &SearchQuery,
     ) -> Result<buzz_search::ScoredResult, SearchError> {
         self.catch_up().await;
-        self.fixture.service.search_scored(query).await
+        self.fixture
+            .service
+            .search_scored(&self.routed(query))
+            .await
+    }
+
+    /// `query` as the backend under test runs it. A search of every kind
+    /// stays on Postgres, so on OpenSearch it names the indexed kinds: the
+    /// same search there, since the index holds no other kind.
+    fn routed(&self, query: &SearchQuery) -> SearchQuery {
+        let mut query = query.clone();
+        if self.fixture.opensearch.is_some() && query.kinds.is_none() {
+            query.kinds = Some(buzz_db::search_outbox::SEARCHABLE_KINDS.to_vec());
+        }
+        query
     }
 
     async fn catch_up(&self) {

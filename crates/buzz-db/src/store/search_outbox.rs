@@ -2,7 +2,8 @@
 //! index.
 //!
 //! When [`enable`] has been called (the relay does so when it is configured
-//! with an OpenSearch address), every write that changes what search should
+//! with an OpenSearch address; account deletion calls [`enable_if_indexed`]
+//! instead), every write that changes what search should
 //! return queues a `search_outbox` row in the same transaction, so a change
 //! always has its index update queued and a rolled-back write never does. The
 //! write makes no call to the search engine. Those writes are:
@@ -95,6 +96,40 @@ pub async fn enable(pool: &PgPool) -> Result<()> {
     }
     ENABLED.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Turn the outbox on, for the life of the process, if this database's
+/// search index is maintained, and return whether it is on. For processes
+/// other than the relay that change searchable events (account deletion),
+/// which have no OpenSearch address of their own.
+///
+/// The index is maintained once an indexing relay has queued work here: the
+/// outbox holds rows, or the indexer's backfill has recorded progress, which
+/// it keeps until the community is purged. In a deployment that has never
+/// had an indexer both tables are empty, so nothing is queued that no one
+/// would drain.
+pub async fn enable_if_indexed(pool: &PgPool) -> Result<bool> {
+    if ENABLED.load(Ordering::Relaxed) {
+        return Ok(true);
+    }
+    let tables: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.search_outbox') IS NOT NULL \
+                AND to_regclass('public.search_backfill') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !tables {
+        return Ok(false);
+    }
+    let indexed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM search_outbox) OR EXISTS (SELECT 1 FROM search_backfill)",
+    )
+    .fetch_one(pool)
+    .await?;
+    if indexed {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+    Ok(indexed)
 }
 
 /// Queue the index change for an event this admitted transaction inserted,
