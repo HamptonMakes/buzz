@@ -664,7 +664,7 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
 
     // With an OpenSearch address, admission queues searchable events in the
     // search outbox, the indexer (spawned below) drains it, and the
-    // `search.backend` flag chooses per community whether searches use
+    // `search.backend` flag chooses for the whole relay whether searches use
     // Postgres, shadow OpenSearch, or OpenSearch. Without one, Postgres
     // serves every search and the flag is never read.
     let search_index = match &config.opensearch {

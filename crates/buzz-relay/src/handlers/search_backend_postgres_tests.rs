@@ -9,11 +9,11 @@
 //! line land in the test's recorder and log capture.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use buzz_core::{CommunityId, TenantContext};
+use buzz_core::TenantContext;
 use buzz_db::search_outbox::SearchDocument;
 use buzz_feature_flags::{BooleanFlag, EvaluationContext, FlagEvaluator, IntegerFlag};
 use buzz_search::opensearch::{OpenSearchConfig, SearchIndex};
@@ -31,14 +31,15 @@ fn opensearch_url() -> String {
     std::env::var("BUZZ_TEST_OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into())
 }
 
-/// `search.backend` values per community, changeable while the relay runs,
-/// like a LaunchDarkly flag.
+/// The relay's `search.backend` value, changeable while the relay runs, like
+/// a LaunchDarkly flag. It answers only the process context: the switch must
+/// not be evaluated for the searched community.
 #[derive(Default)]
-struct BackendFlags(Mutex<HashMap<CommunityId, i64>>);
+struct BackendFlags(AtomicI64);
 
 impl BackendFlags {
-    fn set(&self, community: CommunityId, value: i64) {
-        self.0.lock().unwrap().insert(community, value);
+    fn set(&self, value: i64) {
+        self.0.store(value, Ordering::SeqCst);
     }
 }
 
@@ -49,10 +50,12 @@ impl FlagEvaluator for BackendFlags {
 
     fn evaluate_int(&self, flag: IntegerFlag, context: &EvaluationContext) -> i64 {
         assert_eq!(flag, buzz_search::SEARCH_BACKEND_FLAG);
-        context
-            .community()
-            .and_then(|community| self.0.lock().unwrap().get(&community).copied())
-            .unwrap_or(flag.default())
+        assert_eq!(
+            *context,
+            EvaluationContext::for_process(),
+            "search.backend is one value for the whole relay"
+        );
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -137,8 +140,8 @@ impl Fixture {
         }
     }
 
-    fn set_backend(&self, community: &Community, value: i64) {
-        self.flags.set(community.tenant.community(), value);
+    fn set_backend(&self, value: i64) {
+        self.flags.set(value);
     }
 
     /// Ingest a kind:9 message from the owner in `channel`; return its ID.
@@ -376,17 +379,17 @@ impl FakeCluster {
     }
 }
 
-/// At 0, Postgres serves and OpenSearch is never contacted; at 2, the same
-/// community's results come from OpenSearch; the flag targets one community
-/// without touching another; and changing it applies to the next search,
-/// with no restart.
+/// At 0, Postgres serves and OpenSearch is never contacted; at 2, every
+/// community's results come from OpenSearch, so the relay never mixes
+/// backends; and changing the flag applies to the next search, with no
+/// restart.
 /// Mutation: route every setting to Postgres → RED (no OpenSearch-only hit
 /// at 2). Evaluate the flag once at construction → RED (the switch back to 0
-/// still serves OpenSearch). Evaluate it without the community → RED (B
-/// follows A).
+/// still serves OpenSearch). Evaluate it for the searched community → RED
+/// (the evaluator answers only the process context).
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
-async fn the_flag_picks_the_backend_per_community_while_the_relay_runs() {
+async fn the_flag_picks_the_backend_for_the_whole_relay_while_it_runs() {
     let recorder = DebuggingRecorder::new();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut recorded = Recorded::new(&recorder);
@@ -416,17 +419,23 @@ async fn the_flag_picks_the_backend_per_community_while_the_relay_runs() {
     assert_eq!(recorded.requests("postgres", "primary", "hits"), 1);
     assert_eq!(recorded.requests("postgres", "primary", "zero_results"), 1);
 
-    // 2 for A only.
-    f.set_backend(&a, 2);
-    assert_eq!(f.search(&a, &a.owner, &os_word).await, expected(&a));
-    assert_eq!(f.search(&a, &a.owner, &pg_word).await, Ok(vec![]));
-    assert_eq!(f.search(&b, &b.owner, &pg_word).await, expected(&b));
-    assert_eq!(f.search(&b, &b.owner, &os_word).await, Ok(vec![]));
+    // 2: both communities move together.
+    f.set_backend(2);
+    for community in [&a, &b] {
+        assert_eq!(
+            f.search(community, &community.owner, &os_word).await,
+            expected(community)
+        );
+        assert_eq!(
+            f.search(community, &community.owner, &pg_word).await,
+            Ok(vec![])
+        );
+    }
     recorded.collect();
-    assert_eq!(recorded.requests("opensearch", "primary", "hits"), 1);
+    assert_eq!(recorded.requests("opensearch", "primary", "hits"), 2);
     assert_eq!(
         recorded.requests("opensearch", "primary", "zero_results"),
-        1
+        2
     );
     assert_eq!(
         recorded
@@ -435,13 +444,21 @@ async fn the_flag_picks_the_backend_per_community_while_the_relay_runs() {
                 &[("backend", "opensearch"), ("role", "primary")]
             )
             .len(),
-        2
+        4
     );
 
-    // Back to 0 for A, with no restart.
-    f.set_backend(&a, 0);
-    assert_eq!(f.search(&a, &a.owner, &pg_word).await, expected(&a));
-    assert_eq!(f.search(&a, &a.owner, &os_word).await, Ok(vec![]));
+    // Back to 0, with no restart.
+    f.set_backend(0);
+    for community in [&a, &b] {
+        assert_eq!(
+            f.search(community, &community.owner, &pg_word).await,
+            expected(community)
+        );
+        assert_eq!(
+            f.search(community, &community.owner, &os_word).await,
+            Ok(vec![])
+        );
+    }
     f.delete().await;
 }
 
@@ -478,7 +495,7 @@ async fn shadow_serves_postgres_and_records_both_backends() {
     let mut recorded = Recorded::new(&recorder);
     let f = Fixture::on_opensearch().await;
     let c = f.community().await;
-    f.set_backend(&c, 1);
+    f.set_backend(1);
 
     let shared = word("shadowshared");
     let os_only = word("shadowos");
@@ -563,7 +580,7 @@ async fn a_slow_or_failing_shadow_does_not_touch_the_response() {
         let cluster = FakeCluster::start(answer_500).await;
         let f = Fixture::new(cluster.index.clone(), DEADLINE).await;
         let c = f.community().await;
-        f.set_backend(&c, 1);
+        f.set_backend(1);
         let needle = word("slow");
         let message = f.post(&c, c.private, &needle).await;
 
@@ -597,7 +614,7 @@ async fn at_two_an_opensearch_failure_fails_the_search() {
     let cluster = FakeCluster::start(true).await;
     let f = Fixture::new(cluster.index.clone(), Duration::from_secs(1)).await;
     let c = f.community().await;
-    f.set_backend(&c, 2);
+    f.set_backend(2);
     let needle = word("down");
     f.post(&c, c.private, &needle).await;
 
@@ -627,7 +644,7 @@ async fn every_value_rechecks_access_on_every_hit() {
     f.index_as(&c, &message, &secret, c.open).await;
 
     for value in [0, 1, 2] {
-        f.set_backend(&c, value);
+        f.set_backend(value);
         assert_eq!(
             f.search(&c, &outsider, &secret).await,
             Ok(vec![]),
@@ -650,7 +667,7 @@ async fn every_value_rechecks_access_on_every_hit() {
 async fn at_two_a_deleted_message_left_in_the_index_is_dropped() {
     let f = Fixture::on_opensearch().await;
     let c = f.community().await;
-    f.set_backend(&c, 2);
+    f.set_backend(2);
     let gone = word("gone");
     let message = f.post(&c, c.private, &gone).await;
     f.index_as(&c, &message, &gone, c.private).await;
@@ -681,7 +698,7 @@ async fn at_two_a_deleted_message_left_in_the_index_is_dropped() {
 async fn at_two_a_removed_member_no_longer_finds_the_channel() {
     let f = Fixture::on_opensearch().await;
     let c = f.community().await;
-    f.set_backend(&c, 2);
+    f.set_backend(2);
     let reader = Keys::generate();
     let membership = |kind: u16| {
         EventBuilder::new(Kind::Custom(kind), "")
@@ -714,7 +731,7 @@ async fn at_two_a_document_of_another_community_is_dropped() {
     let f = Fixture::on_opensearch().await;
     let here = f.community().await;
     let there = f.community().await;
-    f.set_backend(&here, 2);
+    f.set_backend(2);
     let twin = EventBuilder::new(Kind::Custom(9007), "")
         .tag(Tag::parse(["h", &here.open.to_string()]).unwrap())
         .tag(Tag::parse(["name", "twin"]).unwrap());
@@ -852,7 +869,7 @@ async fn prefix_searches_stay_on_postgres_and_are_counted() {
     };
 
     for (value, setting) in [(1, "shadow"), (2, "opensearch")] {
-        f.set_backend(&c, value);
+        f.set_backend(value);
         let hits = f.state.search.search(&query).await.expect("search");
         assert_eq!(
             hits.hits.iter().map(|hit| hit.event_id).collect::<Vec<_>>(),
@@ -936,7 +953,7 @@ async fn searches_of_unindexed_kinds_stay_on_postgres() {
     let words = buzz_search::SearchMode::FullText;
     let prefix = buzz_search::SearchMode::Prefix;
 
-    f.set_backend(&c, 2);
+    f.set_backend(2);
     assert_eq!(
         found(query(Some(vec![0]), words)).await,
         vec![profile.id.to_bytes()]
@@ -947,7 +964,7 @@ async fn searches_of_unindexed_kinds_stay_on_postgres() {
         found(query(Some(vec![0]), prefix)).await,
         vec![profile.id.to_bytes()]
     );
-    f.set_backend(&c, 1);
+    f.set_backend(1);
     assert_eq!(found(query(Some(vec![9, 0]), words)).await, both);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -968,7 +985,7 @@ async fn searches_of_unindexed_kinds_stay_on_postgres() {
         (4, 1, 0)
     );
 
-    f.set_backend(&c, 2);
+    f.set_backend(2);
     f.state
         .search
         .search(&query(Some(vec![9]), words))

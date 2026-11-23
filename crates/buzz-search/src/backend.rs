@@ -1,4 +1,4 @@
-//! Which engine answers a message search, chosen per community by the
+//! Which engine answers a message search, chosen for the whole relay by the
 //! `search.backend` flag, and the shadow comparison between the two.
 //!
 //! | Flag value | Setting | Who serves | OpenSearch |
@@ -9,10 +9,11 @@
 //!
 //! Any other value means Postgres and counts in
 //! `buzz_search_backend_flag_invalid_total`. The flag is read on every search, in
-//! [`Selection::setting`] alone, so a provider that changes values while the
-//! relay runs (LaunchDarkly) switches a community without a restart, and
-//! changing the flag's scope (per relay instead of per community) is a change
-//! there. Without an OpenSearch address the relay builds a
+//! [`Selection::setting`] alone, for the relay process and not for the
+//! searched community, so a relay never serves some communities from one
+//! engine and some from the other. A provider that changes values while the
+//! relay runs (LaunchDarkly) switches the relay without a restart. Without an
+//! OpenSearch address the relay builds a
 //! [`crate::SearchService`] with no OpenSearch backend and never reads it.
 //!
 //! **Unsupported queries.** OpenSearch serves word mode only until prefix
@@ -56,7 +57,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use buzz_core::CommunityId;
 use buzz_feature_flags::{EvaluationContext, FlagEvaluator, IntegerFlag};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::info;
@@ -66,7 +66,7 @@ use buzz_db::search_outbox::SEARCHABLE_KINDS;
 use crate::opensearch::SearchIndex;
 use crate::{SearchError, SearchMode, SearchQuery, SearchResult};
 
-/// Integer flag choosing the search backend per community; see the module
+/// Integer flag choosing the search backend for the relay; see the module
 /// docs. Environment form: `BUZZ_FEATURE_FLAG_SEARCH_BACKEND`.
 pub const SEARCH_BACKEND_FLAG: IntegerFlag = IntegerFlag::new("search.backend", 0);
 
@@ -81,7 +81,7 @@ pub const SHADOW_MAX_IN_FLIGHT: usize = 32;
 /// How many top hits the shadow overlap compares.
 pub const OVERLAP_TOP: usize = 10;
 
-/// What a community's `search.backend` value asks for.
+/// What the relay's `search.backend` value asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSetting {
     /// Postgres serves; OpenSearch is not queried (0, and unknown values).
@@ -120,7 +120,7 @@ impl BackendSetting {
 pub(crate) enum Selection {
     /// Always this setting (tests and tools).
     Fixed(BackendSetting),
-    /// [`SEARCH_BACKEND_FLAG`], evaluated for the searched community.
+    /// [`SEARCH_BACKEND_FLAG`], evaluated for the relay process.
     Flag(Arc<dyn FlagEvaluator>),
 }
 
@@ -135,13 +135,12 @@ impl std::fmt::Debug for Selection {
 
 impl Selection {
     /// The one place the switch is read.
-    fn setting(&self, community: CommunityId) -> BackendSetting {
+    fn setting(&self) -> BackendSetting {
         match self {
             Self::Fixed(setting) => *setting,
-            Self::Flag(flags) => BackendSetting::from_flag_value(flags.evaluate_int(
-                SEARCH_BACKEND_FLAG,
-                &EvaluationContext::for_community(community),
-            )),
+            Self::Flag(flags) => BackendSetting::from_flag_value(
+                flags.evaluate_int(SEARCH_BACKEND_FLAG, &EvaluationContext::for_process()),
+            ),
         }
     }
 }
@@ -197,7 +196,7 @@ impl OpenSearchBackend {
 
     /// Decide where `query` runs, starting the shadow search if it gets one.
     pub(crate) fn route(&self, query: &SearchQuery) -> Route<'_> {
-        let setting = self.selection.setting(query.community);
+        let setting = self.selection.setting();
         if setting == BackendSetting::Postgres {
             return Route::Postgres;
         }
@@ -372,7 +371,7 @@ mod tests {
     #[test]
     fn only_searches_of_indexed_kinds_reach_the_index() {
         let query = |kinds: Option<Vec<i32>>| SearchQuery {
-            community: CommunityId::from_uuid(uuid::Uuid::nil()),
+            community: buzz_core::CommunityId::from_uuid(uuid::Uuid::nil()),
             q: "word".into(),
             channel_scope: crate::ChannelScope::Any,
             kinds,

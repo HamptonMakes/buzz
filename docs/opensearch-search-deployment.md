@@ -1,7 +1,7 @@
 # OpenSearch message index deployment
 
 The relay can keep an OpenSearch index of messages up to date. Searches run on
-Postgres full-text search unless the `search.backend` flag moves a community to
+Postgres full-text search unless the `search.backend` flag moves the relay to
 shadow mode or to OpenSearch (see [Choosing the search backend](#choosing-the-search-backend)).
 
 ## How it works
@@ -132,7 +132,8 @@ the backfill passes log their rates as they catch up.
 ## Choosing the search backend
 
 With `BUZZ_OPENSEARCH_URL` set, the integer flag `search.backend` chooses the
-backend for each community, read on every search:
+backend for the whole relay, read on every search. A relay never serves some
+communities from one backend and some from the other:
 
 | Value | Results from | OpenSearch |
 | --- | --- | --- |
@@ -151,10 +152,11 @@ shadowed; it is counted with `reason="unindexed_kinds"`. Message search names
 message kinds and follows the flag.
 
 The flag comes from the relay's feature-flag provider
-(`BUZZ_FEATURE_FLAGS_PROVIDER`). LaunchDarkly can target one community (the
-`community` context) and changes apply within seconds, without a restart. The
-`environment` provider sets one value for every community on the instance and
-is read once at startup:
+(`BUZZ_FEATURE_FLAGS_PROVIDER`). With LaunchDarkly the flag is evaluated for the
+relay itself (the `relay` context), not for a community, and a change applies
+within seconds, without a restart: that is also the rollback. The
+`environment` provider is read once at startup, so changing the value there
+takes a restart:
 
 ```sh
 BUZZ_FEATURE_FLAGS_PROVIDER=environment BUZZ_FEATURE_FLAG_SEARCH_BACKEND=1 just relay
