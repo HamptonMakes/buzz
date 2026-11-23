@@ -3,40 +3,21 @@
 //!
 //! When [`enable`] has been called (the relay does so when it is configured
 //! with an OpenSearch address; account deletion calls [`enable_if_indexed`]
-//! instead), every write that changes what search should
-//! return queues a `search_outbox` row in the same transaction, so a change
-//! always has its index update queued and a rolled-back write never does. The
-//! write makes no call to the search engine. Those writes are:
+//! instead), every write that changes what search should return queues a
+//! `search_outbox` row in the same transaction, so a change always has its
+//! index update queued and a rolled-back write never does. The write makes
+//! no call to the search engine.
 //!
-//! - admitting a [`SEARCHABLE_KINDS`] event (through the event insert
-//!   follow-up);
-//! - admitting or deleting a message edit, which queues the message it edits;
-//! - soft-deleting an event (NIP-09 and NIP-29 deletions, moderation);
-//! - account deletion scrubbing or erasing an author's messages.
+//! The indexer re-reads `events` for every row it claims, so duplicate or
+//! out-of-order rows for one event are harmless.
 //!
-//! A source-policy test in `tests/observability_source.rs` fails when a new
-//! production `UPDATE events` or `DELETE FROM events` neither queues a row
-//! nor is listed as never touching a searchable kind. Replaceable and
-//! addressable kinds are never searchable, so replacing one never changes
-//! search results. Purging a community's documents from the index is not
-//! queued here: the purge deletes the community's rows, this queue included.
+//! Each event belongs to one of [`CLAIM_PARTITIONS`] partitions of its
+//! community, and a batch locks every partition it claims from until it
+//! commits. So two batches never hold states of one message at once, and
+//! an older state is never written after a newer one.
 //!
-//! The indexer drains the queue with [`claim_batch`]: it locks rows,
-//! re-reads the events they name (with an edited message's current text),
-//! writes the index, and calls [`SearchOutboxBatch::complete_except`] to
-//! delete exactly the rows it claimed whose index writes succeeded. Because
-//! the indexer re-reads `events`, the order and number of rows for one event
-//! don't matter, and a change committed while its message's earlier row is
-//! being indexed keeps its own row for the next batch.
-//!
-//! Several batches of one community can run at once. Each event belongs to
-//! one of [`CLAIM_PARTITIONS`] partitions of its community, by the first byte
-//! of its id, and a batch holds a lock on every partition it claims from
-//! until it completes. So every row naming one event is claimed by at most
-//! one batch at a time, and a later batch re-reads the event only after the
-//! earlier one has written the index and committed: two states of one
-//! message, or a delete and an earlier state, are never written out of
-//! order.
+//! Purging a community's documents is not queued here: the purge deletes
+//! the community's rows, this queue included.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

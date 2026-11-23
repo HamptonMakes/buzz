@@ -1,35 +1,17 @@
 //! The indexer: drains `search_outbox` into the OpenSearch index.
 //!
-//! One relay instance holds the indexer lease (a session advisory lock) at a
-//! time; when it stops, its lock connection closes and another instance takes
-//! over on its next attempt. Instances that start together spread their
-//! attempts with jitter. The lease holder runs a configurable number of
-//! workers ([`Indexer::with_workers`]), so at most that many bulk requests
-//! are in flight. Workers can index one community together: each batch
-//! claims a share of the community's queue partitions, and every row of one
-//! event belongs to one partition, so no two batches in flight hold states
-//! of the same message (see `buzz_db::search_outbox`).
-//!
-//! Each batch re-reads its events from Postgres, writes them (or removes the
-//! documents of events that are gone) in one bulk request, and only then
-//! deletes the claimed rows whose items succeeded. A failed item, or a failed
-//! request, leaves its rows queued for the next attempt, and its community is
-//! skipped for the rest of the pass so others keep indexing. Items the
-//! cluster refuses for good (HTTP 400 or 413) are logged and counted but do
-//! not back the indexer off. Throttling (HTTP 429) ends the pass and backs
-//! off with jitter, without counting as a failure.
+//! One relay at a time holds the indexer lease (a session advisory lock);
+//! when it stops, its lock connection closes and another relay takes over.
+//! Rows are deleted only once the index holds their events, so a failed
+//! request leaves them queued.
 //!
 //! A batch holds its community's admission open for up to one request
 //! timeout. Community deletion's quiesce step waits for that batch, and once
 //! the community is quiescing no new batch for it can start.
 //!
-//! The leader also backfills events stored before the index existed (see
-//! `buzz_db::search_backfill`): before each drain it queues their keys,
-//! newest first, one batch per community in turn, but only while the outbox
-//! holds fewer than the backfill bound (or, with several workers, two batches
-//! per worker if that is more). Live rows so wait behind at most that many
-//! backfill rows, and Postgres reads one batch of history at a time. Only
-//! the lease holder backfills, so a fleet queues each event once.
+//! Only the lease holder backfills (see `buzz_db::search_backfill`), so a
+//! fleet queues each stored event once, and only while the outbox has room,
+//! so live rows wait behind a bounded number of backfill rows.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

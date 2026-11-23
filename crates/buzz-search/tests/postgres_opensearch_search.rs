@@ -1134,7 +1134,6 @@ async fn set_clock_skew(db: &Db, micros: i64) {
 /// cluster applies after a later one, as when its indexer timed out or
 /// crashed with the request in flight, changes nothing. Its items come back
 /// as conflicts, which nobody reads: its batch has ended.
-/// Mutation: write without the external version → RED.
 #[tokio::test]
 #[ignore = "requires Postgres and OpenSearch"]
 async fn a_late_write_cannot_undo_a_newer_one() {
@@ -1182,7 +1181,6 @@ async fn a_late_write_cannot_undo_a_newer_one() {
 /// written at a version the sequence has not reached. The newer state stays
 /// queued and the pass fails, and once the sequence passes the version the
 /// index holds, it is written.
-/// Mutation: count a version conflict as written → RED.
 #[tokio::test]
 #[ignore = "requires Postgres and OpenSearch"]
 async fn a_newer_state_below_the_held_version_stays_queued() {
@@ -1245,7 +1243,6 @@ async fn a_newer_state_below_the_held_version_stays_queued() {
 /// request wins, the index keeps the older text, and no live batch ever
 /// meets a conflict. Here the clock runs 10 s ahead for the first batch and
 /// is put back before the second.
-/// Mutation: read the version from `clock_timestamp()` → RED.
 #[tokio::test]
 #[ignore = "requires Postgres and OpenSearch"]
 async fn a_late_request_from_before_a_clock_step_changes_nothing() {
