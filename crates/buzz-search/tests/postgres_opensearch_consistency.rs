@@ -1,35 +1,22 @@
 //! Randomized consistency of the OpenSearch index under interleaving.
 //!
-//! Each run, from a printed seed, writes a random mix of messages, replies,
-//! edits, deletions and account deletions across several communities while
-//! indexers drain the outbox and backfill stored messages at the same time.
-//! A proxy in front of the cluster injects faults: whole-request throttling,
-//! per-item failures, outages, lost responses and stalled requests, and the
-//! driver crashes indexers mid-batch and runs two at once, as during a lease
-//! handover. Once the writers stop, everything drains, and the index must
-//! hold exactly one document for every searchable message Postgres holds,
-//! with its current text and fields, and nothing else.
+//! Each seed writes a random mix of messages, edits, deletions and account
+//! deletions while indexers drain and backfill, a proxy injects cluster
+//! faults, and the driver crashes indexers mid-batch. After everything
+//! drains, the index must hold exactly one document, with its current text,
+//! for every searchable message Postgres holds, and nothing else.
 //!
-//! The seed fixes the plan (operations, fault odds, worker counts), not the
-//! thread interleaving, so a failing seed may need a few runs to reproduce.
-//!
-//! Needs Postgres and an OpenSearch cluster at `BUZZ_TEST_OPENSEARCH_URL`
-//! (default `http://localhost:9200`), and a database of its own: every run
-//! checks the whole outbox, so `BUZZ_TEST_DATABASE_URL` must name a
-//! dedicated database (or run it through `scripts/postgres-test-run.sh -p
-//! buzz-search --tests`). Settings:
+//! The seed fixes the plan, not the thread interleaving, so a failing seed
+//! may need a few runs to reproduce. Every run checks the whole outbox, so
+//! `BUZZ_TEST_DATABASE_URL` must name a database of its own. Settings:
 //!
 //! - `BUZZ_TEST_CONSISTENCY_SEEDS`: a seed (`7`) or an inclusive range
 //!   (`1-300`); default `1-3`;
 //! - `BUZZ_TEST_CONSISTENCY_OPS`: operations per writer; default 20;
-//! - `BUZZ_TEST_CONSISTENCY_LATE_APPLY`: `1` lets a request stalled when its
-//!   indexer crashes reach the cluster afterwards, as a bulk request the
-//!   cluster is still working through when its client times out would. The
-//!   request waits until a later request has written one of its documents,
-//!   or at most 0-1.5 s, so it lands after the newer write;
-//! - `BUZZ_TEST_CONSISTENCY_SEQUENCE_BACK`: `1` sets the version sequence
-//!   back by 1-50 values now and then, as promoting an asynchronous replica
-//!   that had not seen the latest values would.
+//! - `BUZZ_TEST_CONSISTENCY_LATE_APPLY=1`: a request stalled when its
+//!   indexer crashes reaches the cluster after a newer write;
+//! - `BUZZ_TEST_CONSISTENCY_SEQUENCE_BACK=1`: the version sequence is set
+//!   back now and then, as promoting a lagging replica would.
 
 #[allow(unused_macros, unused_imports)]
 mod search_suite;

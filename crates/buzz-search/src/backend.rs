@@ -3,50 +3,22 @@
 //!
 //! | Flag value | Setting | Who serves | OpenSearch |
 //! |---|---|---|---|
-//! | 0 (default) | [`BackendSetting::Postgres`] | Postgres | not queried |
+//! | 0 (default, and unknown values) | [`BackendSetting::Postgres`] | Postgres | not queried |
 //! | 1 | [`BackendSetting::Shadow`] | Postgres | queried off the response path and compared |
 //! | 2 | [`BackendSetting::OpenSearch`] | OpenSearch | its failures fail the search |
 //!
-//! Any other value means Postgres and counts in
-//! `buzz_search_backend_flag_invalid_total`. The flag is read on every search, in
-//! [`Selection::setting`] alone, for the relay process and not for the
-//! searched community, so a relay never serves some communities from one
-//! engine and some from the other. A provider that changes values while the
-//! relay runs (LaunchDarkly) switches the relay without a restart. Without an
-//! OpenSearch address the relay builds a
-//! [`crate::SearchService`] with no OpenSearch backend and never reads it.
+//! The flag is evaluated for the relay process, not the searched community,
+//! so a relay never serves some communities from one engine and some from
+//! the other. It is read on every search, so a provider that changes values
+//! while the relay runs switches it without a restart.
 //!
-//! Both search modes run on either backend. An OpenSearch failure at setting
-//! 2 fails the search: there is no fallback to Postgres.
+//! A search that names a kind outside
+//! [`buzz_db::search_outbox::SEARCHABLE_KINDS`], or names no kinds, stays on
+//! Postgres at every setting: the index would silently drop those results.
+//! That is a routing rule known before the search runs, not a fallback: an
+//! OpenSearch failure at setting 2 still fails the search.
 //!
-//! **Unindexed kinds.** The index holds only
-//! [`buzz_db::search_outbox::SEARCHABLE_KINDS`], while Postgres searches
-//! every kind it indexes for full-text search (profiles, artifacts and
-//! more). A search that names another kind, or names no kinds and so asks
-//! for all of them, stays on Postgres at every setting and is not shadowed
-//! (`reason="unindexed_kinds"`): OpenSearch would silently drop those
-//! results.
-//!
-//! **Shadow.** Only first pages are compared. The OpenSearch query starts
-//! before the Postgres one, on its own task with its own deadline
-//! ([`SHADOW_DEADLINE`]) and at most [`SHADOW_MAX_IN_FLIGHT`] at once; a search that finds every slot taken
-//! skips the comparison (`reason="shadow_busy"`). Postgres' result is handed
-//! to the task when it is ready and returned to the caller at once, so a slow
-//! or failing OpenSearch never delays or fails the response.
-//!
-//! **Metrics**, all without query text:
-//! - `buzz_search_duration_seconds{backend, role}` (histogram): search
-//!   latency, `role` = `primary` (served the caller) or `shadow`;
-//! - `buzz_search_requests_total{backend, role, outcome}`: `outcome` is
-//!   `hits`, `zero_results` (a first page with no hits), `empty_page` (a
-//!   later page with none), `error` (including partly failed OpenSearch
-//!   searches) or `timeout` (a shadow search past its deadline);
-//! - `buzz_search_shadow_overlap_ratio` (histogram): shared share of the top
-//!   [`OVERLAP_TOP`] hits, recorded when either backend found something;
-//! - `buzz_search_opensearch_skipped_total{setting, reason}`.
-//!
-//! Each shadow comparison also logs one `search shadow comparison` line with
-//! the community, page, hit counts, overlap, latencies and outcomes.
+//! Metrics and the shadow log line never carry query text.
 
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -1,64 +1,28 @@
 //! How the index analyzes message text and how a search ranks it.
 //!
 //! Every relevance choice lives here: the analyzers, the text fields they
-//! fill, the match query and the age rescore. The rest of
-//! [`super`] only filters and pages.
+//! fill, the match query and the age rescore. The rest of [`super`] only
+//! filters and pages. The reasons the code can't show:
 //!
-//! **Fields.** `content` holds whole words and their parts; `content.stem`
-//! holds light English stems; `content.prefix` holds word prefixes for
-//! [`SearchMode::Prefix`]. The two subfields keep term frequencies but no
-//! positions, because no phrase query reads them.
-//!
-//! **Analysis**, the same splitting for every field:
-//! - the `standard` tokenizer splits words on Unicode word boundaries (UAX
-//!   #29), so markdown punctuation (quotes, backticks, `**`, link brackets,
-//!   fences) never sticks to a word;
-//! - `word_delimiter_graph` keeps each token whole and adds its parts, split
-//!   at `.`, `_`, `-`, `:` and case changes, so `docs.example.org`,
-//!   `config.prod.yaml`, `buzz_search` and `getUserName` match whole and by
-//!   part. It does not split letters from digits, so a hex id stays one token
-//!   instead of dozens of fragments;
-//! - `lowercase`, then `asciifolding`, so accented and plain spellings meet.
-//!
-//! Queries use the same chain without the word-delimiter: a query token
-//! matches either a whole indexed token or one of its parts.
-//!
-//! **Prefixes** ([`prefix_mapping`] and [`prefix_query`], the only two places
-//! to change to use `index_prefixes` instead): edge n-grams of
-//! [`MIN_PREFIX`] to [`MAX_PREFIX`] characters, of tokens up to
-//! [`LONG_TOKEN`] characters. Longer tokens (`nostr:` URIs, keys, hashes,
-//! ids) get none: nobody types them a letter at a time, and each would add
-//! dozens of prefixes. The searched word is cut to [`MAX_PREFIX`]
-//! characters, so a longer partial word matches by its start.
-//!
-//! **Query match (Q)**, BM25 with its length normalization on:
-//! - each query word must match in one of three ways, scored by the best:
-//!   exactly, by its stem ([`STEM_WEIGHT`]), or with a typo ([`TYPO_WEIGHT`]);
-//!   in prefix mode the last word may instead be a prefix
-//!   ([`PREFIX_WEIGHT`]) and is never corrected;
-//! - the words are OR-ed with a minimum ([`MIN_WORDS_MATCHED`]);
-//! - an exact phrase ([`PHRASE_WEIGHT`]) and the words close together
-//!   ([`PROXIMITY_WEIGHT`]) add a bonus, scored for the top
-//!   [`RESCORE_WINDOW`] hits by the words alone. Phrase matching reads the
-//!   positions of every message holding all the words, so in the main query
-//!   it cost 55 ms for two common words on a million messages, against 22 ms
-//!   in the window, and grows with the history.
-//!
-//! Typo matching is one clause, [`typo_clause`]: dropping it, for example for
-//! a separate spell checker, leaves the rest as it is.
-//!
-//! **Age (T)** = `0.2 + 0.8 × 0.5^(age / 30 days)`. A rescore multiplies Q by
-//! T for the top [`RESCORE_WINDOW`] hits by Q (per shard), and only for them,
-//! which bounds the rescore's cost. Matching
-//! still skips documents that cannot reach the top, so search cost does not
-//! grow with every match a common word has. The trade-off: a weak match
-//! outside the window cannot be lifted by recency.
-//!
-//! **Serverless.** Built-in analysis only (no ICU plugin), `rescore` with a
-//! `function_score` `exp` decay, and no scripts. Each still has to be checked
-//! on a real Serverless collection: `word_delimiter_graph`, `edge_ngram`,
-//! `length`, `truncate`, the `light_english` stemmer, `rescore`, and `function_score`
-//! decay inside it.
+//! - **Letters and digits stay together.** `word_delimiter_graph` splits at
+//!   `.`, `_`, `-`, `:` and case changes but not between letters and digits,
+//!   so a hex id stays one token instead of dozens of fragments.
+//! - **Long tokens get no prefixes.** Tokens over [`LONG_TOKEN`] characters
+//!   (`nostr:` URIs, keys, hashes) are not typed a letter at a time, and
+//!   each would add dozens of prefixes.
+//! - **Phrase and proximity are a rescore.** They read the positions of
+//!   every message holding all the words. In the main query that cost 55 ms
+//!   for two common words on a million messages, against 22 ms over the top
+//!   [`RESCORE_WINDOW`] hits, and it grows with the history.
+//! - **Age is a rescore too**: `0.2 + 0.8 × 0.5^(age / 30 days)`, applied to
+//!   the top [`RESCORE_WINDOW`] hits per shard. Matching can still skip
+//!   documents that cannot reach the top, so cost does not grow with every
+//!   match of a common word. The trade-off: recency cannot lift a weak match
+//!   from outside the window.
+//! - **Serverless.** Built-in analysis only (no ICU plugin) and no scripts.
+//!   `word_delimiter_graph`, `edge_ngram`, `length`, `truncate`, the
+//!   `light_english` stemmer and `rescore` with a `function_score` decay
+//!   have not been checked on a Serverless collection.
 
 use serde_json::{json, Value};
 
