@@ -1,21 +1,11 @@
 //! Search backfill: queues the keys of events stored before the search index
 //! existed, so they reach it through the same outbox as live writes.
 //!
-//! Each community has a `search_backfill` row holding a cursor, the
-//! `(created_at, id)` key of the oldest event queued so far. A [`step`] takes
-//! one community, queues the next batch of its searchable events below the
-//! cursor, newest first, and moves the cursor, all in one admitted
-//! transaction: a restart resumes from the last committed batch, and a
-//! fenced community is neither read nor written. A short batch marks the
-//! community complete. A community without a row starts from its newest
-//! event, so a new deployment, a new community and a deleted row (an
-//! operator's way to backfill again) all backfill without further setup.
-//!
-//! The caller bounds the work: it steps only while [`outbox_below`] says the
-//! outbox has room, so a backfill never buries live rows behind more than
-//! that bound and loads Postgres one batch at a time. Queuing an event that
-//! is already indexed only rewrites its document, so running a backfill
-//! again creates no duplicates.
+//! Each community's `search_backfill` row holds a cursor that moves in the
+//! same transaction as the batch it queues, so a restart resumes from the
+//! last committed batch. A community without a row starts from its newest
+//! event: deleting the row is how an operator backfills again. Queuing an
+//! indexed event again only rewrites its document.
 
 use buzz_core::CommunityId;
 use chrono::{DateTime, Utc};
