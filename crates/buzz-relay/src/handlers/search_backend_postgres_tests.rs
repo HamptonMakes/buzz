@@ -383,6 +383,10 @@ impl FakeCluster {
 /// community's results come from OpenSearch, so the relay never mixes
 /// backends; and changing the flag applies to the next search, with no
 /// restart.
+/// Mutation: route every setting to Postgres → RED (no OpenSearch-only hit
+/// at 2). Evaluate the flag once at construction → RED (the switch back to 0
+/// still serves OpenSearch). Evaluate it for the searched community → RED
+/// (the evaluator answers only the process context).
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
 async fn the_flag_picks_the_backend_for_the_whole_relay_while_it_runs() {
@@ -459,6 +463,7 @@ async fn the_flag_picks_the_backend_for_the_whole_relay_while_it_runs() {
 }
 
 /// At 0, a cluster that would answer is never contacted.
+/// Mutation: start the shadow search at every setting → RED.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres and Redis"]
 async fn at_zero_opensearch_is_never_queried() {
@@ -479,6 +484,8 @@ async fn at_zero_opensearch_is_never_queried() {
 /// At 1, Postgres serves; OpenSearch runs the same query, and overlap,
 /// latency and zero-result metrics are recorded for both, with one log line
 /// per comparison that never holds the query text.
+/// Mutation: serve the shadow result → RED (the OpenSearch-only word finds
+/// a message). Skip the overlap histogram → RED.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
 async fn shadow_serves_postgres_and_records_both_backends() {
@@ -560,6 +567,8 @@ async fn shadow_serves_postgres_and_records_both_backends() {
 
 /// At 1, an OpenSearch that hangs or fails neither slows nor fails the
 /// response; its searches count as a timeout or an error.
+/// Mutation: await the shadow search before returning → RED (the hanging
+/// cluster holds the REQ for the deadline).
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres and Redis"]
 async fn a_slow_or_failing_shadow_does_not_touch_the_response() {
@@ -595,6 +604,7 @@ async fn a_slow_or_failing_shadow_does_not_touch_the_response() {
 
 /// At 2, an OpenSearch failure fails the search through the usual CLOSED
 /// error: no silent fallback to Postgres.
+/// Mutation: answer from Postgres when OpenSearch fails → RED.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres and Redis"]
 async fn at_two_an_opensearch_failure_fails_the_search() {
@@ -620,6 +630,8 @@ async fn at_two_an_opensearch_failure_fails_the_search() {
 /// At every value, each hit is re-read from Postgres and re-checked: a
 /// message the searcher cannot read is never returned, even when the index
 /// files it under a channel the searcher can read.
+/// Mutation: skip the hydrated channel check in `handle_search_req` → RED at
+/// 2.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
 async fn every_value_rechecks_access_on_every_hit() {
@@ -649,6 +661,7 @@ async fn every_value_rechecks_access_on_every_hit() {
 
 /// At 2, with the indexer paused, a deleted message still in the index is
 /// never returned: the relay's re-read drops it.
+/// Mutation: emit hits without the Postgres re-read → RED.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
 async fn at_two_a_deleted_message_left_in_the_index_is_dropped() {
@@ -677,6 +690,9 @@ async fn at_two_a_deleted_message_left_in_the_index_is_dropped() {
 
 /// At 2, a member removed from a private channel no longer finds its
 /// messages, though the index still files them under that channel.
+/// Mutation: keep the reader's cached channel access after the removal →
+/// RED. Skipping only the per-hit channel check stays green: the query is
+/// already scoped to the reader's channels.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
 async fn at_two_a_removed_member_no_longer_finds_the_channel() {
@@ -708,6 +724,7 @@ async fn at_two_a_removed_member_no_longer_finds_the_channel() {
 /// Channel ids are unique only within a community, so the other community
 /// holds a channel with the same id as one the reader belongs to, and the
 /// channel check alone would let the hit through.
+/// Mutation: re-read hits without the community → RED.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres, Redis and OpenSearch"]
 async fn at_two_a_document_of_another_community_is_dropped() {
@@ -732,6 +749,7 @@ async fn at_two_a_document_of_another_community_is_dropped() {
 /// the queued rows and lag ages with the oldest; once the indexer drains the
 /// queue, both read zero. Runs on a scratch database so the counts are this
 /// test's alone.
+/// Mutation: take lag from the newest row → RED.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres and OpenSearch"]
 async fn outbox_gauges_follow_a_paused_and_resumed_indexer() {
@@ -823,6 +841,8 @@ async fn outbox_gauges_follow_a_paused_and_resumed_indexer() {
 /// Prefix mode, which OpenSearch does not serve yet, stays on Postgres at
 /// every value and is counted: shadow skips the comparison, and 2 serves it
 /// from Postgres. Not a fallback: OpenSearch is never tried.
+/// Mutation: route prefix searches like word searches → RED (the cluster is
+/// contacted, and at 2 the search fails).
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres and Redis"]
 async fn prefix_searches_stay_on_postgres_and_are_counted() {
@@ -876,6 +896,8 @@ async fn prefix_searches_stay_on_postgres_and_are_counted() {
 /// before the mode rule, so a people search (kind 0, in prefix mode as
 /// clients send it) counts there too. A message-kind search at 2 still
 /// reaches the cluster.
+/// Mutation: drop the kind check from routing → RED (the cluster is
+/// contacted and fails the word searches at 2).
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Postgres and Redis"]
 async fn searches_of_unindexed_kinds_stay_on_postgres() {
