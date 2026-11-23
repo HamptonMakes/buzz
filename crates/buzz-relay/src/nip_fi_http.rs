@@ -182,10 +182,17 @@ use crate::nip_fi_shadow::{Stage, WouldDeny};
 ///
 /// Sealed: only implementations in this crate are accepted.
 pub(crate) trait HttpDenyMap: sealed::Sealed {
-    /// Returns `true` when `(issuer, pubkey)` has an active deny entry at
-    /// `now` (`now < until`).  Implementations fail closed: a poisoned or
-    /// unavailable backing store returns `true` (deny).
-    fn is_denied(&self, issuer: &str, pubkey: &PublicKey, now: DateTime<Utc>) -> bool;
+    /// Returns `true` when an entry for `(issuer, pubkey)` active at `now`
+    /// (`now < until`) covers an assertion whose verified signed `iat` is
+    /// `issued_at`.  Implementations fail closed: a poisoned or unavailable
+    /// backing store returns `true` (deny).
+    fn is_denied(
+        &self,
+        issuer: &str,
+        pubkey: &PublicKey,
+        issued_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> bool;
 }
 
 pub(crate) mod sealed {
@@ -194,10 +201,16 @@ pub(crate) mod sealed {
 
 impl sealed::Sealed for buzz_auth::NipFiDenyMap {}
 impl HttpDenyMap for buzz_auth::NipFiDenyMap {
-    /// Delegates to [`buzz_auth::NipFiDenyMap::is_denied`], which is issuer-
+    /// Delegates to [`buzz_auth::NipFiDenyMap::denies`], which is issuer-
     /// scoped and returns `true` on a poisoned shard.
-    fn is_denied(&self, issuer: &str, pubkey: &PublicKey, now: DateTime<Utc>) -> bool {
-        buzz_auth::NipFiDenyMap::is_denied(self, issuer, pubkey, now)
+    fn is_denied(
+        &self,
+        issuer: &str,
+        pubkey: &PublicKey,
+        issued_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.denies(issuer, pubkey, issued_at, now)
     }
 }
 
@@ -215,7 +228,7 @@ impl HttpDenyMap for buzz_auth::NipFiDenyMap {
 struct NoDenyMapConfigured;
 impl sealed::Sealed for NoDenyMapConfigured {}
 impl HttpDenyMap for NoDenyMapConfigured {
-    fn is_denied(&self, _issuer: &str, _pubkey: &PublicKey, _now: DateTime<Utc>) -> bool {
+    fn is_denied(&self, _: &str, _: &PublicKey, _: DateTime<Utc>, _: DateTime<Utc>) -> bool {
         false
     }
 }
@@ -871,7 +884,7 @@ mod tests {
     struct AlwaysAdmitStubDenyMap;
     impl sealed::Sealed for AlwaysAdmitStubDenyMap {}
     impl HttpDenyMap for AlwaysAdmitStubDenyMap {
-        fn is_denied(&self, _issuer: &str, _pubkey: &PublicKey, _now: DateTime<Utc>) -> bool {
+        fn is_denied(&self, _: &str, _: &PublicKey, _: DateTime<Utc>, _: DateTime<Utc>) -> bool {
             false
         }
     }
@@ -1091,7 +1104,13 @@ mod tests {
         struct FixedDenyMap(bool);
         impl sealed::Sealed for FixedDenyMap {}
         impl HttpDenyMap for FixedDenyMap {
-            fn is_denied(&self, _: &str, _: &PublicKey, _: DateTime<Utc>) -> bool {
+            fn is_denied(
+                &self,
+                _: &str,
+                _: &PublicKey,
+                _: DateTime<Utc>,
+                _: DateTime<Utc>,
+            ) -> bool {
                 self.0
             }
         }

@@ -351,8 +351,9 @@ On WebSocket upgrade:
    this registered connection before step 8; cancellation is terminal, so a
    cancelled connection MUST NOT be admitted.
 7. Check the deny set for `(iss, k)` and, if `verified.owner` is present, for
-   `(iss, verified.owner)`.  Either active entry (`now < until`) denies
-   `authorization_denied`.
+   `(iss, verified.owner)`.  Either entry denies `authorization_denied` when
+   it covers the assertion (see Deny scope); each key is checked
+   independently and either denial wins.
    [FI-TRACE-DENY-SET]
 8. Admit the connection only if it remains live and uncancelled.  The session's
    authority deadline is the minimum of all `authority_deadlines`; see Session
@@ -422,10 +423,49 @@ A disconnect call causes the relay to:
    `503`; no sessions are closed and no replay state is consumed.
 2. Close all live WebSocket connections registered under the command's issuer
    whose proven `k` equals the target pubkey or whose recorded owner equals
-   the target pubkey, whether or not admission has completed, synchronously.
+   the target pubkey, whether or not admission has completed, synchronously,
+   limited to the close scope (see Deny scope).
    Disconnect cancellation is terminal: a cancelled in-progress connection
    MUST NOT be subsequently admitted.  Connections
    registered under another issuer are not affected.
+
+### Deny scope
+
+A command MAY carry `revoke_through` (C).  Without C, its deny entry covers
+the whole key.  With C, it covers only assertions whose verified signed `iat`
+is at or before C.
+
+- **Admission.** An entry `(iss, key, until, C?)` denies an otherwise-valid
+  assertion exactly when `now < until` and either C is absent or the
+  assertion's verified signed `iat <= C`.  The `iat` is the verified claim,
+  never optional profile evidence.  This holds for WebSocket and HTTP
+  admission, for `(iss, k)` and `(iss, verified.owner)` alike.  Every other
+  authorization check still applies.
+- **Close scope.** A command with C closes only matching sessions whose
+  admitting assertion's verified `iat <= C`, including in-progress ones; a
+  command without C closes all matching sessions.  The close scope is the
+  union of the command's scope and the scope of any active entry for the
+  same key after merging, so a stronger active denial also applies.  A
+  session registers its verified `iat` before the post-registration deny
+  check, so a session straddling a disconnect is caught by the close scan or
+  the deny check.  A past-`until` command still performs its scoped close but
+  MUST NOT create, shorten or strengthen an active entry.
+- **Merging.** Merging an incoming entry into an active one takes the later
+  `until`; a whole-key scope beats a cutoff; two cutoffs merge to the larger
+  C.  An expired entry contributes nothing: an active entry ignores an
+  expired incoming one, and an incoming entry replaces an expired one.
+  These rules hold identically for local state, any shared or durable store,
+  inter-process propagation and restore.
+- **Records.** A stored or propagated entry without C means whole-key.
+  Unreadable revocation state MUST NOT be treated as allowed.
+- **Issuer duty.** An issuer that sends C MUST NOT release, after the
+  revocation, an assertion for that key whose `iat <= C`.
+
+Oracle: with an active entry `(iss, k, until, C)`, an assertion for `k`
+signed with `iat = C` is denied and closed by every disconnect for `k`, an
+assertion signed with `iat = C + 1` is admitted and survives every
+redelivery of that command, and a whole-key entry for its owner still denies
+it.  [FI-TRACE-DENY-SET]
 
 The deny set is held **in relay memory only** — no durable storage, no schema
 changes.  A relay restart MAY forget active deny entries.  If the issuer stops
@@ -499,6 +539,7 @@ The command JWT MUST carry the following claims:
 | `cmd` | Exactly `"disconnect"` (literal string).  Operation selector. |
 | `target_pubkey` | Lowercase hexadecimal encoding of the target 32-byte Nostr public key — the same encoding required for the assertion `nostr_pubkey` claim. |
 | `until` | Unix timestamp (NumericDate) at which the deny entry expires.  MUST NOT exceed `now + skew + maximum_assertion_age` for this issuer policy.  The relay validates this ceiling; a value that exceeds it rejects `400`. |
+| `revoke_through` | OPTIONAL.  Integral NumericDate C limiting the deny to assertions with `iat <= C` (see Deny scope).  Absent means the whole key.  A present value that is `null`, nonnumeric, fractional or unrepresentable rejects `evidence_rejected` before any state changes. |
 
 The `maximum_command_age` policy knob is a required positive finite
 configuration per authorized issuer, with a normative upper bound of
@@ -819,8 +860,9 @@ On each protected HTTP request:
 5. Assert `verified.asserted_key == k`; mismatch → deny `authorization_denied`.
    [FI-TRACE-ASSERTION-KEY-MISMATCH]
 6. Check the deny set for `(iss, k)` and, if `verified.owner` is present, for
-   `(iss, verified.owner)`.  Either active entry (`now < until`) denies
-   `authorization_denied`.
+   `(iss, verified.owner)`.  Either entry denies `authorization_denied` when
+   it covers the assertion (see Deny scope); each key is checked
+   independently and either denial wins.
    [FI-TRACE-DENY-SET]
 7. Admit the request.
 

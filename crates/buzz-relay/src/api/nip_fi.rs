@@ -138,17 +138,28 @@ pub async fn disconnect(
             // Issuer-scoped: the deny entry is keyed by (caller_iss, k), so only
             // sessions admitted under caller_iss are closed. [FI-TRACE-DENY-SET]
             // Shadow keeps the deny entry but closes nothing.
+            // The command's scope, widened by any stronger active entry.
+            let scope = state.nip_fi_deny_map.as_ref().map_or(cmd.scope, |map| {
+                map.close_scope(
+                    &cmd.caller_iss,
+                    &cmd.target_pubkey,
+                    cmd.scope,
+                    chrono::Utc::now(),
+                )
+            });
             let closed = if !state.config.nip_fi.mode.observes_only() {
                 state
                     .conn_manager
-                    .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
-                    + state
-                        .community_connections
-                        .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
+                    .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes, scope)
+                    + state.community_connections.disconnect_nip_fi(
+                        &cmd.caller_iss,
+                        &pubkey_bytes,
+                        scope,
+                    )
             } else {
                 state
                     .nip_fi_shadow_sessions
-                    .would_close(&cmd.caller_iss, &pubkey_bytes);
+                    .would_close(&cmd.caller_iss, &pubkey_bytes, scope);
                 0
             };
             if closed > 0 {
@@ -314,6 +325,7 @@ pub fn nip_fi_disconnect_message(cmd: &buzz_auth::CommandResult) -> buzz_pubsub:
         pubkey_bytes: cmd.target_pubkey.to_bytes().to_vec(),
         until_unix: cmd.until.timestamp(),
         until_unix_nanos: cmd.until.timestamp_subsec_nanos(),
+        revoke_through: cmd.scope.revoke_through(),
     }
 }
 
@@ -391,20 +403,30 @@ pub fn apply_nip_fi_disconnect(
 
     // Merge the deny entry.
     use buzz_auth::CrossPodMergeResult;
-    let merge_result = deny_map.merge_cross_pod_deny(&message.issuer, &pubkey, until, now);
+    let command_scope = buzz_auth::DenyScope::from_revoke_through(message.revoke_through);
+    let entry = buzz_auth::DenyEntry {
+        until,
+        scope: command_scope,
+    };
+    let merge_result = deny_map.merge_cross_pod_deny(&message.issuer, &pubkey, entry, now);
+    // The message's scope, widened by any stronger active merged entry.
+    let scope = deny_map.close_scope(&message.issuer, &pubkey, command_scope, now);
 
     // Close sessions for all merge outcomes except UnknownIssuer, never in shadow.
     let close_sessions = |reason: &str| {
         if state.config.nip_fi.mode.observes_only() {
             let sessions = &state.nip_fi_shadow_sessions;
-            return sessions.would_close(&message.issuer, &message.pubkey_bytes);
+            return sessions.would_close(&message.issuer, &message.pubkey_bytes, scope);
         }
-        let closed = state
-            .conn_manager
-            .disconnect_nip_fi(&message.issuer, &message.pubkey_bytes)
-            + state
-                .community_connections
-                .disconnect_nip_fi(&message.issuer, &message.pubkey_bytes);
+        let closed =
+            state
+                .conn_manager
+                .disconnect_nip_fi(&message.issuer, &message.pubkey_bytes, scope)
+                + state.community_connections.disconnect_nip_fi(
+                    &message.issuer,
+                    &message.pubkey_bytes,
+                    scope,
+                );
         if closed > 0 {
             tracing::debug!(closed, reason = reason, "nip-fi cross-pod: closed sessions");
         }
@@ -1279,6 +1301,7 @@ mod route_integration_tests {
             pubkey_bytes: k_a.to_bytes().to_vec(),
             until_unix,
             until_unix_nanos: 0,
+            revoke_through: None,
         };
         let result_a = apply_nip_fi_disconnect(&state, &msg_a, now);
         assert_eq!(
@@ -1313,6 +1336,7 @@ mod route_integration_tests {
             pubkey_bytes: k_b.to_bytes().to_vec(),
             until_unix,
             until_unix_nanos: 0,
+            revoke_through: None,
         };
         let result_b = apply_nip_fi_disconnect(&state, &msg_b, now);
         assert_eq!(
@@ -1510,6 +1534,7 @@ mod route_integration_tests {
             pubkey_bytes: target.to_bytes().to_vec(),
             until_unix,
             until_unix_nanos: 0,
+            revoke_through: None,
         };
         let result = apply_nip_fi_disconnect(&state, &msg, now);
         assert_eq!(
@@ -1565,6 +1590,7 @@ mod route_integration_tests {
             pubkey_bytes: filler.to_bytes().to_vec(),
             until_unix,
             until_unix_nanos: 0,
+            revoke_through: None,
         };
         let fill_result = apply_nip_fi_disconnect(&state, &msg_fill, now);
         assert_eq!(
@@ -1579,6 +1605,7 @@ mod route_integration_tests {
             pubkey_bytes: target2.to_bytes().to_vec(),
             until_unix,
             until_unix_nanos: 0,
+            revoke_through: None,
         };
         let result2 = apply_nip_fi_disconnect(&state, &msg2, now);
         assert_eq!(
@@ -1675,6 +1702,7 @@ mod route_integration_tests {
             caller_sub: TEST_SUB.to_owned(),
             target_pubkey: target,
             until: t_frac,
+            scope: buzz_auth::DenyScope::WholeKey,
         };
 
         // Publisher seam → encode → decode.
@@ -2085,6 +2113,16 @@ mod route_integration_tests {
 
     impl IssuerSessions {
         fn register(state: &crate::state::AppState, issuer: &str, key: &nostr::PublicKey) -> Self {
+            Self::register_issued(state, issuer, key, chrono::Utc::now())
+        }
+
+        /// Sessions admitted by an assertion with verified `iat` `issued_at`.
+        fn register_issued(
+            state: &crate::state::AppState,
+            issuer: &str,
+            key: &nostr::PublicKey,
+            issued_at: chrono::DateTime<chrono::Utc>,
+        ) -> Self {
             use crate::state::CommunityConnectionControl;
             use tokio::sync::mpsc;
             use tokio_util::sync::CancellationToken;
@@ -2107,14 +2145,18 @@ mod route_integration_tests {
             state.conn_manager.set_authenticated_identity(
                 conn_id,
                 key.to_bytes().to_vec(),
-                Some(crate::nip_fi_core::NipFiSession::new(issuer, None)),
+                Some(crate::nip_fi_core::NipFiSession::issued_at(
+                    issuer, None, issued_at,
+                )),
             );
             let audio = CancellationToken::new();
             let ctrl = CommunityConnectionControl::new(audio.clone());
             crate::audio::handler::audio_post_auth_register(
                 &ctrl,
                 key.to_bytes().to_vec(),
-                Some(crate::nip_fi_core::NipFiSession::new(issuer, None)),
+                Some(crate::nip_fi_core::NipFiSession::issued_at(
+                    issuer, None, issued_at,
+                )),
             );
             let _audio_guard =
                 state
@@ -2168,6 +2210,118 @@ mod route_integration_tests {
         under_b.assert_open("issuer B");
     }
 
+    // ── revoke_through: cutoff-scoped close scans ────────────────────────────
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    fn cutoff_message(key: &nostr::PublicKey, c: i64) -> buzz_pubsub::NipFiDisconnect {
+        buzz_pubsub::NipFiDisconnect {
+            revoke_through: Some(c),
+            ..cross_pod_message(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn route_cutoff_closes_old_sessions_and_keeps_fresh_ones_across_redelivery() {
+        let state = build_test_state(1000).await;
+        let key = nostr::Keys::generate().public_key();
+        let c = chrono::Utc::now().timestamp();
+        let old = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c));
+        let fresh = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c + 1));
+
+        let token = mint_token(
+            &key.to_hex(),
+            300,
+            serde_json::json!({ "revoke_through": c }),
+        );
+        let resp = do_request(
+            Arc::clone(&state),
+            "POST",
+            vec![
+                ("Content-Type", "application/json".into()),
+                (CLIENT_ATTACHED_HEADER, format!("Bearer {token}")),
+            ],
+            Some(serde_json::json!({"pubkey": key.to_hex()})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        old.assert_closed("iat == C");
+        fresh.assert_open("iat > C after the route");
+
+        // The issuer's periodic redelivery, and a restore replaying the same
+        // record, arrive as cross-pod messages: still cutoff-scoped.
+        for _ in 0..3 {
+            apply_nip_fi_disconnect(&state, &cutoff_message(&key, c), chrono::Utc::now());
+        }
+        fresh.assert_open("iat > C after redelivery");
+        let deny_map = state.nip_fi_deny_map.as_ref().unwrap();
+        assert!(deny_map.denies(TEST_ISS, &key, at(c), chrono::Utc::now()));
+        assert!(!deny_map.denies(TEST_ISS, &key, at(c + 1), chrono::Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn cross_pod_cutoff_closes_only_old_sessions_on_another_pod() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let c = chrono::Utc::now().timestamp();
+        let old = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c - 30));
+        let fresh = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c + 1));
+        let result = apply_nip_fi_disconnect(&state, &cutoff_message(&key, c), chrono::Utc::now());
+        assert_eq!(
+            result,
+            NipFiDisconnectApplyResult::Applied(buzz_auth::CrossPodMergeResult::Merged)
+        );
+        old.assert_closed("old session");
+        fresh.assert_open("fresh session");
+    }
+
+    #[tokio::test]
+    async fn cutoff_delivery_over_an_active_whole_key_entry_closes_every_session() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let now = chrono::Utc::now();
+        apply_nip_fi_disconnect(&state, &cross_pod_message(&key), now);
+        let c = now.timestamp();
+        let fresh = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c + 1));
+        apply_nip_fi_disconnect(&state, &cutoff_message(&key, c), now);
+        fresh.assert_closed("the stronger merged whole-key deny applies");
+    }
+
+    #[tokio::test]
+    async fn past_until_cutoff_still_closes_its_scope_without_changing_the_deny() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let now = chrono::Utc::now();
+        let c = now.timestamp();
+        let old = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c));
+        let fresh = IssuerSessions::register_issued(&state, TEST_ISS, &key, at(c + 1));
+        let message = buzz_pubsub::NipFiDisconnect {
+            until_unix: c - 1,
+            ..cutoff_message(&key, c)
+        };
+        apply_nip_fi_disconnect(&state, &message, now);
+        old.assert_closed("scoped close still runs");
+        fresh.assert_open("fresh session");
+        let deny_map = state.nip_fi_deny_map.as_ref().unwrap();
+        assert!(
+            !deny_map.is_denied(TEST_ISS, &key, now),
+            "no active deny created"
+        );
+    }
+
+    #[test]
+    fn legacy_bus_message_without_revoke_through_is_whole_key() {
+        let json = r#"{"issuer":"i","pubkey_bytes":[],"until_unix":1}"#;
+        let decoded: buzz_pubsub::NipFiDisconnect = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.revoke_through, None);
+        assert_eq!(
+            buzz_auth::DenyScope::from_revoke_through(decoded.revoke_through),
+            buzz_auth::DenyScope::WholeKey
+        );
+    }
+
     /// State whose registry and deny map know only issuer A (`TEST_ISS`).
     async fn cross_pod_state(capacity: usize) -> Arc<crate::state::AppState> {
         let mut config = crate::config::Config::for_test();
@@ -2216,6 +2370,7 @@ mod route_integration_tests {
             pubkey_bytes: key.to_bytes().to_vec(),
             until_unix: (chrono::Utc::now() + chrono::Duration::seconds(300)).timestamp(),
             until_unix_nanos: 0,
+            revoke_through: None,
         }
     }
 

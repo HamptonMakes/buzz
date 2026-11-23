@@ -30,7 +30,7 @@ use super::command_replay::CommandReplayGuard;
 use super::config::{
     IssuerPolicy, IssuerRegistry, MAX_JTI_BYTES, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES,
 };
-use super::deny_map::{NipFiDenyMap, Reservation, ReserveError};
+use super::deny_map::{DenyEntry, DenyScope, NipFiDenyMap, Reservation, ReserveError};
 use super::verifier::{
     enforce_compact_structure, enforce_signature_shape, parse_header, parse_numeric_date,
     parse_unique_claims, select_unique_jwk, validate_jwk, AssertionKeySet, IssuerKeySource,
@@ -155,6 +155,8 @@ pub struct CommandResult {
     pub caller_sub: String,
     /// The `until` timestamp from the signed JWT.
     pub until: DateTime<Utc>,
+    /// The command's scope: whole key, or `revoke_through` when present.
+    pub scope: DenyScope,
 }
 
 /// Errors from [`CommandVerifier::verify`].
@@ -298,7 +300,7 @@ impl<S: IssuerKeySource + Clone> CommandVerifier<S> {
             Ok(false) => return Err(CommandError::AuthorizationDenied),
             Err(_) => return Err(CommandError::AuthorizationUnavailable),
         }
-        Ok(Self::commit(&cmd, reservation))
+        Ok(Self::commit(&cmd, reservation, now))
     }
 
     /// Verify against this pod's deny map only, with an injectable clock.
@@ -318,7 +320,7 @@ impl<S: IssuerKeySource + Clone> CommandVerifier<S> {
     ) -> Result<CommandResult, CommandError> {
         let cmd = self.authenticate_at(token, request_method, request_path, body_pubkey, now)?;
         let reservation = self.reserve(&cmd, now)?;
-        Ok(Self::commit(&cmd, reservation))
+        Ok(Self::commit(&cmd, reservation, now))
     }
 
     /// Steps 1–5: authenticate and authorize the command with no side effects.
@@ -441,6 +443,8 @@ impl<S: IssuerKeySource + Clone> CommandVerifier<S> {
 
         // until: NumericDate.
         let until = numeric_date(&claims, "until")?;
+        // revoke_through: optional integral NumericDate; absent = whole key.
+        let scope = DenyScope::from_revoke_through(revoke_through(&claims)?);
 
         // Validate `until` ceiling: until <= now + skew + maximum_assertion_age.
         let max_assertion_age =
@@ -478,6 +482,7 @@ impl<S: IssuerKeySource + Clone> CommandVerifier<S> {
             // effective_expiry = min(exp, iat + maximum_command_age).
             effective_expiry: exp.min(iat_plus_cmd_age),
             until,
+            scope,
             skew_seconds: base_policy.skew_seconds(),
         })
     }
@@ -497,13 +502,22 @@ impl<S: IssuerKeySource + Clone> CommandVerifier<S> {
     }
 
     /// Step 7: record the jti and deny entry; cannot fail.
-    fn commit(cmd: &AuthenticatedCommand, reservation: Reservation) -> CommandResult {
-        reservation.commit(cmd.effective_expiry, cmd.until);
+    fn commit(
+        cmd: &AuthenticatedCommand,
+        reservation: Reservation,
+        now: DateTime<Utc>,
+    ) -> CommandResult {
+        let entry = DenyEntry {
+            until: cmd.until,
+            scope: cmd.scope,
+        };
+        reservation.commit(cmd.effective_expiry, entry, now);
         CommandResult {
             target_pubkey: cmd.target_pubkey,
             caller_iss: cmd.issuer.clone(),
             caller_sub: cmd.sub.clone(),
             until: cmd.until,
+            scope: cmd.scope,
         }
     }
 }
@@ -516,6 +530,7 @@ struct AuthenticatedCommand {
     jti: String,
     effective_expiry: DateTime<Utc>,
     until: DateTime<Utc>,
+    scope: DenyScope,
     skew_seconds: u64,
 }
 
@@ -532,6 +547,18 @@ fn claim_ttl_secs(effective_expiry: DateTime<Utc>, now: DateTime<Utc>, skew_seco
 
 fn claim_str<'a>(claims: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     claims.get(key)?.as_str().filter(|s| !s.is_empty())
+}
+
+/// The optional `revoke_through` claim.  A present value must be an integral
+/// NumericDate that is representable as a timestamp; `null`, nonnumeric,
+/// fractional or out-of-range values are rejected.
+fn revoke_through(claims: &Map<String, Value>) -> Result<Option<i64>, CommandError> {
+    let Some(value) = claims.get("revoke_through") else {
+        return Ok(None);
+    };
+    let secs = value.as_i64().ok_or(CommandError::EvidenceRejected)?;
+    DateTime::from_timestamp(secs, 0).ok_or(CommandError::EvidenceRejected)?;
+    Ok(Some(secs))
 }
 
 fn numeric_date(claims: &Map<String, Value>, key: &str) -> Result<DateTime<Utc>, CommandError> {
@@ -1661,5 +1688,74 @@ mod tests {
             !deny_map.is_denied(ISS, &target, now_past),
             "must be admitted past the fractional deadline"
         );
+    }
+
+    // ── revoke_through ────────────────────────────────────────────────────────
+
+    #[test]
+    fn revoke_through_scopes_the_deny_to_assertions_issued_through_it() {
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let c = now.timestamp();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({ "revoke_through": c }));
+        let result = cv
+            .verify_at(&token, METHOD, PATH, &target, now)
+            .expect("accepted");
+        assert_eq!(result.scope, DenyScope::IssuedThrough(c));
+        let later = now + Duration::seconds(1);
+        let old = DateTime::from_timestamp(c, 0).unwrap();
+        let fresh = DateTime::from_timestamp(c + 1, 0).unwrap();
+        assert!(
+            cv.deny_map().denies(ISS, &target, old, later),
+            "iat <= C is refused"
+        );
+        assert!(
+            !cv.deny_map().denies(ISS, &target, fresh, later),
+            "iat > C is admitted"
+        );
+    }
+
+    #[test]
+    fn absent_revoke_through_denies_the_whole_key() {
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({}));
+        let result = cv
+            .verify_at(&token, METHOD, PATH, &target, now)
+            .expect("accepted");
+        assert_eq!(result.scope, DenyScope::WholeKey);
+        let fresh = now + Duration::seconds(10);
+        assert!(cv
+            .deny_map()
+            .denies(ISS, &target, fresh, now + Duration::seconds(1)));
+    }
+
+    #[test]
+    fn invalid_revoke_through_is_evidence_rejected_before_any_change() {
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!("1800000000"),
+            serde_json::json!(1_800_000_000.5),
+            serde_json::json!(true),
+            serde_json::json!([1]),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(i64::MAX),
+        ] {
+            let token = mint_cmd_jwt(&target, 300, serde_json::json!({ "revoke_through": bad }));
+            assert_eq!(
+                cv.verify_at(&token, METHOD, PATH, &target, now),
+                Err(CommandError::EvidenceRejected),
+                "{bad}"
+            );
+            assert!(
+                !cv.deny_map().is_denied(ISS, &target, now),
+                "{bad}: a rejected command changes nothing"
+            );
+        }
     }
 }

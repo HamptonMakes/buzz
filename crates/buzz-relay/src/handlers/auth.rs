@@ -1823,7 +1823,11 @@ mod tests {
             Some(crate::nip_fi_core::NipFiSession::new("test-issuer", None)),
         );
         assert_eq!(
-            state.conn_manager.disconnect_nip_fi("test-issuer", &pubkey),
+            state.conn_manager.disconnect_nip_fi(
+                "test-issuer",
+                &pubkey,
+                buzz_auth::DenyScope::WholeKey
+            ),
             1
         );
         let admin_disconnect = harness.wire_frames().await;
@@ -3816,9 +3820,11 @@ mod tests {
             // With the deny entry live, the scan finds exactly one session matching this
             // pubkey and closes it.
             let pubkey_bytes = target.to_bytes().to_vec();
-            let closed = state
-                .conn_manager
-                .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+            let closed = state.conn_manager.disconnect_nip_fi(
+                "test-issuer",
+                &pubkey_bytes,
+                buzz_auth::DenyScope::WholeKey,
+            );
             assert_eq!(
                 closed, 1,
                 "W_deny_straddle: close scan must find exactly 1 registered session \
@@ -4003,12 +4009,15 @@ mod tests {
                 buzz_auth::CrossPodMergeResult::Merged
             ));
             let pubkey_bytes = key.public_key().to_bytes().to_vec();
-            let closed = state
-                .conn_manager
-                .disconnect_nip_fi(ISSUER_A, &pubkey_bytes)
-                + state
-                    .community_connections
-                    .disconnect_nip_fi(ISSUER_A, &pubkey_bytes);
+            let closed = state.conn_manager.disconnect_nip_fi(
+                ISSUER_A,
+                &pubkey_bytes,
+                buzz_auth::DenyScope::WholeKey,
+            ) + state.community_connections.disconnect_nip_fi(
+                ISSUER_A,
+                &pubkey_bytes,
+                buzz_auth::DenyScope::WholeKey,
+            );
             assert_eq!(
                 closed, 0,
                 "issuer A's close scan must not match a session admitted under B"
@@ -4178,9 +4187,11 @@ mod tests {
 
             // The close scan runs while the connection is still unproven: it
             // must miss it, leaving the handler's check as the only defence.
-            let closed = state
-                .conn_manager
-                .disconnect_nip_fi("test-issuer", &key.public_key().to_bytes());
+            let closed = state.conn_manager.disconnect_nip_fi(
+                "test-issuer",
+                &key.public_key().to_bytes(),
+                buzz_auth::DenyScope::WholeKey,
+            );
             assert_eq!(closed, 0, "close scan must miss the unproven connection");
             assert!(!cancel.is_cancelled());
 

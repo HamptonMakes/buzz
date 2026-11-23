@@ -4918,11 +4918,14 @@ mod tests {
 
         let mut wire = Vec::new();
         if scan_first {
-            assert_eq!(registry.disconnect_nip_fi("test-issuer", &key), 1);
+            assert_eq!(
+                registry.disconnect_nip_fi("test-issuer", &key, buzz_auth::DenyScope::WholeKey),
+                1
+            );
         }
         deny_audio_authorization(&mut wire, &control, &mut terminal_rx).await;
         if !scan_first {
-            registry.disconnect_nip_fi("test-issuer", &key);
+            registry.disconnect_nip_fi("test-issuer", &key, buzz_auth::DenyScope::WholeKey);
         }
         (wire, terminal_rx)
     }
@@ -7131,7 +7134,7 @@ mod tests {
     //   - `after_deny_set_check_passed` hook holds the handler AFTER the terminal
     //     sender is registered and the deny-set check has passed (so the direct
     //     map-denial branch is not what produces the frame).
-    //   - Test calls `registry.disconnect_nip_fi("test-issuer", &pubkey)` while the hook holds.
+    //   - Test calls `registry.disconnect_nip_fi("test-issuer", &pubkey, buzz_auth::DenyScope::WholeKey)` while the hook holds.
     //     `CommunityConnectionControl::disconnect_nip_fi` enqueues the denial frame
     //     on `terminal_frame_tx`, publishes `AuthorizationDenied`, then cancels.
     //   - Hook is released; handler observes cancellation, drains the denial
@@ -7295,9 +7298,11 @@ mod tests {
         // CommunityConnectionControl::disconnect_nip_fi enqueues the denial frame on
         // the registered terminal sender, publishes AuthorizationDenied, then cancels.
         let pubkey_bytes = key.public_key().to_bytes().to_vec();
-        let closed = state
-            .community_connections
-            .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+        let closed = state.community_connections.disconnect_nip_fi(
+            "test-issuer",
+            &pubkey_bytes,
+            buzz_auth::DenyScope::WholeKey,
+        );
         assert_eq!(
             closed, 1,
             "W_admin_disconnect: registry scan must find exactly 1 audio session \
@@ -7504,9 +7509,11 @@ mod tests {
 
         // Simulate admin-disconnect at the exact old-gap position.
         let pubkey_bytes = key.public_key().to_bytes().to_vec();
-        let closed = state
-            .community_connections
-            .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+        let closed = state.community_connections.disconnect_nip_fi(
+            "test-issuer",
+            &pubkey_bytes,
+            buzz_auth::DenyScope::WholeKey,
+        );
         assert_eq!(
             closed, 1,
             "W_addc: registry scan must find exactly 1 audio session \
@@ -8098,9 +8105,11 @@ mod tests {
         //   disconnect_nip_fi returns 0 (not yet registered) → assertion panics.
         //   Causally falsifies the registration-before-check invariant.
         let pubkey_bytes = target.to_bytes().to_vec();
-        let closed = state
-            .community_connections
-            .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+        let closed = state.community_connections.disconnect_nip_fi(
+            "test-issuer",
+            &pubkey_bytes,
+            buzz_auth::DenyScope::WholeKey,
+        );
         assert_eq!(
             closed, 1,
             "W_audio_deny_straddle: close scan must find exactly 1 registered audio session \
@@ -16351,9 +16360,11 @@ mod tests {
 
             if issuer_first {
                 assert_eq!(
-                    state
-                        .community_connections
-                        .disconnect_nip_fi("test-issuer", &member_bytes),
+                    state.community_connections.disconnect_nip_fi(
+                        "test-issuer",
+                        &member_bytes,
+                        buzz_auth::DenyScope::WholeKey
+                    ),
                     1
                 );
             }

@@ -53,7 +53,7 @@ impl ShadowSessions {
     /// [`NipFiSession`] matches, at once if admitted or at its admit if still
     /// pending; a session already ended records nothing, so re-sent denies
     /// are idempotent.
-    pub(crate) fn would_close(&self, issuer: &str, pubkey: &[u8]) {
+    pub(crate) fn would_close(&self, issuer: &str, pubkey: &[u8], scope: buzz_auth::DenyScope) {
         let live: Vec<_> = self
             .registered()
             .values()
@@ -62,7 +62,12 @@ impl ShadowSessions {
         for session in live {
             let assertion = &session.assertion;
             if assertion.asserted_key().is_some_and(|key| {
-                NipFiSession::from_assertion(assertion).matches(issuer, &key.to_bytes(), pubkey)
+                NipFiSession::from_assertion(assertion).matches(
+                    issuer,
+                    &key.to_bytes(),
+                    pubkey,
+                    scope,
+                )
             }) {
                 session.revoke();
             }
@@ -465,9 +470,11 @@ pub(crate) mod tests {
     }
 
     fn revoke(state: &AppState, key: &PublicKey) {
-        state
-            .nip_fi_shadow_sessions
-            .would_close("test-issuer", &key.to_bytes());
+        state.nip_fi_shadow_sessions.would_close(
+            "test-issuer",
+            &key.to_bytes(),
+            buzz_auth::DenyScope::WholeKey,
+        );
     }
 
     // Mutation: recording on a repeated AUTH, or letting the re-sent deny
@@ -481,9 +488,11 @@ pub(crate) mod tests {
             auth(&s, &state, key);
             auth(&s, &state, key);
             revoke(&state, &Keys::generate().public_key());
-            state
-                .nip_fi_shadow_sessions
-                .would_close("other-issuer", &key.to_bytes());
+            state.nip_fi_shadow_sessions.would_close(
+                "other-issuer",
+                &key.to_bytes(),
+                buzz_auth::DenyScope::WholeKey,
+            );
             revoke(&state, &key);
             revoke(&state, &key);
         });
@@ -528,6 +537,7 @@ pub(crate) mod tests {
             pubkey_bytes: key.to_bytes().to_vec(),
             until_unix: (Utc::now() + Duration::minutes(5)).timestamp(),
             until_unix_nanos: 0,
+            revoke_through: None,
         };
         match crate::api::nip_fi::apply_nip_fi_disconnect(state, &msg, Utc::now()) {
             crate::api::nip_fi::NipFiDisconnectApplyResult::Applied(merged) => merged,
@@ -645,9 +655,11 @@ pub(crate) mod tests {
                 s.observe_pairing(agent);
                 s.observe_deny_set(&state);
             }
-            state
-                .nip_fi_shadow_sessions
-                .would_close("other-issuer", &owner.to_bytes());
+            state.nip_fi_shadow_sessions.would_close(
+                "other-issuer",
+                &owner.to_bytes(),
+                buzz_auth::DenyScope::WholeKey,
+            );
             for s in &admitted {
                 assert!(matches!(*s.phase.lock().unwrap(), Phase::Admitted));
             }
