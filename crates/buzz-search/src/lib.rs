@@ -5,7 +5,7 @@
 //! [`SearchService`] answers from one of two backends: Postgres full-text
 //! search, described below, or the [`opensearch`] index, which
 //! [`indexer::Indexer`] keeps in sync from the `search_outbox` queue. With
-//! OpenSearch configured, the `search.backend` flag picks per community
+//! OpenSearch configured, the `search.backend` flag picks for the whole relay
 //! between them, or runs OpenSearch as a shadow of Postgres ([`backend`]).
 //!
 //! ## Postgres full-text search
@@ -30,7 +30,7 @@
 //! filters on the community first. A query bound to community
 //! A cannot return events stored under community B, by construction.
 
-/// Choosing the search backend per community, and shadow comparisons.
+/// Choosing the relay's search backend, and shadow comparisons.
 pub mod backend;
 #[doc(hidden)]
 pub mod cancel;
@@ -104,7 +104,7 @@ impl SearchService {
     }
 
     /// Build a search service that chooses Postgres, shadow or OpenSearch
-    /// per community from [`SEARCH_BACKEND_FLAG`] in `flags`, read on every
+    /// for the whole relay from [`SEARCH_BACKEND_FLAG`] in `flags`, read on every
     /// search; see [`backend`].
     pub fn with_opensearch_switch(
         pool: PgPool,
